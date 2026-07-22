@@ -7,28 +7,11 @@ GPUs, CPU, and liquid-cooling loop on one screen — including sensors the usual
 It's a single dependency-free Python script (stdlib only) and **degrades gracefully**: every data
 source is optional, and anything unsupported on your machine simply shows `n/a` instead of failing.
 
-```
-supersensor  2026-07-23 00:18:36    refresh 1s
+![supersensor in action](supersensor.gif)
 
-  GPU 0  NVIDIA RTX PRO 6000 Blackwell Workstation Edition
-    util ░░░░░░░░░░░░░░░░░░░░░░   0%   180MHz
-    vram ██████████████████████  98%   95860 / 97887 MiB
-    temp  28C   mem-temp  30C   hotspot  31C   fan   0%   power 14/600W
-  ... (one block per GPU) ...
-
-  CPU  48 cores
-    usage ░░░░░░░░░░░░░░░░░░░░░░   1%   3336MHz   temp  34C   power 62W (cores 1W)
-     0 ░░░░░   2%   1 █░░░░  18%   2 ░░░░░   1%   3 ░░░░░   2%   4 ░░░░░   1%  ...
-     7 ░░░░░   0%   8 ░░░░░   0%   9 ░░░░░   0%  10 ░░░░░   1%  ...        (one cell per core)
-
-  Coolant  water 28.2C   flow 164.2 L/h
-
-  Power  GPU 48W   CPU 62W   total 110W
-
-  Ctrl-C to quit
-```
-
-Values are color-coded by load/temperature (green → yellow → red) in a real terminal.
+*Four GPUs under a live vLLM workload while a CPU load ramps across all cores. Values are
+color-coded by load/temperature (green → yellow → red); each GPU shows core/memory/hot-spot temps
+and power, the CPU shows aggregate + per-core usage, and the loop shows coolant temp + flow.*
 
 ## What it shows
 
