@@ -94,22 +94,25 @@ core temp) and corrects it, but a current build avoids the guesswork.
 
 **Memory and hot spot are matched to GPUs by a learned map.** `nvidia-gpu-sensors`
 enumerates GPUs via RM's `GPU_GET_PROBED_IDS` and prints no PCI bus id, so its row numbers are
-not nvidia-smi's indices and cannot be joined directly -- on a 4x RTX PRO 6000 host here, its row
-3 is nvidia-smi's GPU 2. Joining them by index shows one card's memory temperature against
-another.
+not nvidia-smi's indices and cannot be joined directly -- on a 4x RTX PRO 6000 host here its row
+2 is nvidia-smi's GPU 1. Joining by index shows one card's memory temperature against another.
 
-supersensor instead matches rows to GPUs by core temperature, which both report. That only
-identifies a card while it sits at a temperature no other card shares, so each sample pins
-whichever cards it can and the result accumulates in `~/.cache/supersensor/rowmap.json`, keyed by
-the set of PCI bus ids present. The last row falls out by elimination. Until the map is complete
-those two columns read `n/a`; once it is, they are reused even when every card is idle and
-indistinguishable. A reading that contradicts the stored map -- cards reseated into different
-slots -- discards it and relearns.
+supersensor matches rows to GPUs by core temperature, which both report. That identifies a card
+only while it sits at a temperature no other card shares, so each sample pins whichever cards it
+can, the result accumulates in `~/.cache/supersensor/rowmap.json` keyed by the set of PCI bus ids
+present, and the last row falls out by elimination. Until a card is recognised its memory and hot
+spot read `n/a`; once the map is complete it is reused even when every card is idle and
+indistinguishable. A reading that contradicts the map -- cards moved between slots -- discards it
+and relearns.
 
-Ordinary use fills the map in, since it only needs each GPU to be busy alone once. To force it,
-put one GPU under load at a time (`CUDA_VISIBLE_DEVICES=<n>` with `CUDA_DEVICE_ORDER=PCI_BUS_ID`
-on any GPU workload) and run supersensor between each. Set `$SUPERSENSOR_STATE` to relocate the
-cache.
+Uneven load during ordinary use fills the map in on its own; each GPU only has to be busier than
+the others once. On startup supersensor also tries to force it, loading each unrecognised GPU
+briefly via `stress.py`, which needs a CUDA-capable torch on the monitoring host -- often absent
+even on a machine that runs GPUs, in which case it says so and falls back to learning passively.
+`--no-autolearn` skips that entirely; `$SUPERSENSOR_STATE` relocates the cache.
+
+Note that a `sudo supersensor` run creates the cache directory; it is handed back to the invoking
+user so later unprivileged runs can still write it.
 
 ## CPU package power
 

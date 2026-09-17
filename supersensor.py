@@ -29,6 +29,9 @@ def parse_args():
     p.add_argument("--gpu-sensors", metavar="PATH", default=None,
                    help="path to nvidia-gpu-sensors binary (for GPU mem/hot-spot temps; "
                         "auto-detected, or set SUPERSENSOR_GPU_SENSORS)")
+    p.add_argument("--no-autolearn", action="store_true",
+                   help="skip the one-time per-GPU load used to identify which sensor row "
+                        "belongs to which GPU (those columns stay blank until it runs)")
     return p.parse_args()
 
 
@@ -199,8 +202,16 @@ def _save_map(gpus, mapping):
         with open(tmp, "w") as fh:
             json.dump(all_maps, fh, indent=1, sort_keys=True)
         os.replace(tmp, path)
-        if os.environ.get("SUDO_UID"):        # keep it owned by the invoking user
-            os.chown(path, int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", -1)))
+        if os.environ.get("SUDO_UID"):
+            # Hand the directory as well as the file back to the invoking user: created
+            # root-owned by a sudo run, it would otherwise be unwritable ever after.
+            uid = int(os.environ["SUDO_UID"])
+            gid = int(os.environ.get("SUDO_GID", -1))
+            for target in (d, path):
+                try:
+                    os.chown(target, uid, gid)
+                except OSError:
+                    pass
     except OSError:
         pass                                  # read-only fs: fall back to re-deriving
 
@@ -265,6 +276,100 @@ def _align(rows, gpus, tol=3.0):
     if len(learned) != len(gpus) or set(learned) != set(rows):
         return {}                                      # not resolved yet
     return {idx: rows[row] for row, idx in learned.items()}
+
+
+def _unknown(gpus):
+    """GPU indices whose sensor row is not yet identified."""
+    known = set((_load_map(gpus) or {}).values())
+    return [g["index"] for g in gpus if g["index"] not in known]
+
+
+def _load_gen():
+    """(interpreter, stress.py) able to load a single GPU, or None.
+
+    stress.py needs a CUDA-capable torch, which a monitoring host often does not have
+    even when it runs GPUs -- a CPU-only torch, or none outside a container. Check
+    before spawning, so a machine without one is told plainly instead of waiting out a
+    load that never happens."""
+    stress = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stress.py")
+    if not os.path.isfile(stress):
+        return None
+    probe = "import torch, sys; sys.exit(0 if torch.cuda.device_count() else 1)"
+    for py in (sys.executable, shutil.which("python3")):
+        if not py:
+            continue
+        try:
+            if subprocess.run([py, "-c", probe], timeout=60,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                return py, stress
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def autolearn(binary, budget=75.0, size=16384, quiet=False):
+    """Identify each GPU's sensor row, and remember it.
+
+    Rows are matched to GPUs by core temperature, which distinguishes a card only while
+    it sits at a temperature no other card shares. Every sample pins whatever it can
+    and the result persists, so uneven load during ordinary use fills the map in by
+    itself -- no load of our own required, and nothing is repeated once a card is
+    known.
+
+    When a CUDA-capable torch is available this also loads each still-unknown GPU
+    briefly to force the issue, which turns "eventually" into "now". Without one, the
+    passive route is all there is: the memory and hot-spot columns stay blank for the
+    cards not yet recognised."""
+    if not binary:
+        return
+    gpus = read_gpu_info()
+    if not gpus:
+        return
+    read_gpu_extra(binary, gpus)                 # a free pin if the machine is uneven
+    missing = _unknown(read_gpu_info())
+    if not missing:
+        return
+    say = (lambda m: None) if quiet else (lambda m: print(m, file=sys.stderr, flush=True))
+    gen = _load_gen()
+    if not gen:
+        say(f"{PROG}: sensor row unknown for GPU(s) {', '.join(map(str, missing))}; "
+            f"will be learned when they run at different temperatures "
+            f"(no CUDA-capable torch here to force it)")
+        return
+    py, stress = gen
+    say(f"{PROG}: identifying sensor rows for GPU(s) {', '.join(map(str, missing))} "
+        f"\u2014 one-time, up to {budget:.0f}s each, stopping as soon as each is known")
+    for index in missing:
+        env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID")
+        try:
+            proc = subprocess.Popen(
+                [py, stress, "--gpu", str(index), "--size", str(size),
+                 "--timeout", str(int(budget) + 5), "--interval", "1e9"],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        except (OSError, subprocess.SubprocessError) as err:
+            say(f"{PROG}: could not start stress.py ({err})")
+            return
+        try:
+            deadline = time.monotonic() + budget
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:      # died early: report why, do not wait
+                    why = (proc.stderr.read() or "").strip().splitlines()
+                    say(f"{PROG}: stress.py exited: {why[-1] if why else 'no output'}")
+                    return
+                time.sleep(2.0)
+                live = read_gpu_info()
+                read_gpu_extra(binary, live)     # pins and persists as a side effect
+                if live and index not in _unknown(live):
+                    say(f"{PROG}: GPU {index} identified")
+                    break
+            else:
+                say(f"{PROG}: GPU {index} did not become distinguishable")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 def read_gpu_extra(binary, gpus=()):
@@ -642,6 +747,10 @@ def main():
     turbo = TurbostatMeter(args.interval)
     gpu_sensors = find_gpu_sensors(args.gpu_sensors)
     gs_fails = 0   # disable the helper after repeated empties (unsupported / not root)
+    if not args.no_autolearn:
+        # One-time: work out which sensor row is which GPU, then remember it. No-op
+        # once the map is complete, so only the first run on a machine pays for it.
+        autolearn(gpu_sensors, quiet=once)
     # prime CPU/power deltas so the first frame shows real values, not noise
     time.sleep(min(args.interval, 0.3))
     if once and turbo.snapshot() is None:
