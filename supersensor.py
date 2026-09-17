@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, glob, os, shutil, subprocess, sys, threading, time
+import argparse, glob, itertools, os, shutil, subprocess, sys, threading, time
 
 PROG = "supersensor"
 
@@ -126,18 +126,71 @@ def _parse_gpu_sensors(text):
         row = dict(zip(names, vals))
         res[int(toks[0])] = {"core": row.get("Core Temp"), "mem": row.get("Mem Temp"),
                              "hotspot": row.get("Hot Spot")}
-    return res
+    return _untranspose(res)
 
 
-def read_gpu_extra(binary):
-    """Run nvidia-gpu-sensors once; {} if unavailable (missing binary / not root)."""
-    if not binary:
+def _untranspose(rows):
+    """Undo the Mem/Hot Spot column swap of older nvidia-gpu-sensors builds.
+
+    Those print the header as Core|Mem|Hot Spot while emitting Core|Hot Spot|Mem, so
+    parsing by header position lands each value in the other's column. Hot spot is the
+    max over the on-die sensor array and so can never read below core temp; one row
+    breaking that proves the build swaps them, and the fix applies to the whole table.
+    Only swap when doing so makes every row consistent, so one odd reading cannot flip
+    a correct table."""
+    vals = [r for r in rows.values() if None not in (r["core"], r["mem"], r["hotspot"])]
+    if not vals or not any(r["hotspot"] < r["core"] for r in vals):
+        return rows
+    if not all(r["mem"] >= r["core"] for r in vals):
+        return rows                      # swapping would not fix it, so leave it alone
+    for r in rows.values():
+        r["mem"], r["hotspot"] = r["hotspot"], r["mem"]
+    return rows
+
+
+def _align(rows, gpus, tol=3.0):
+    """Map nvidia-gpu-sensors rows onto nvidia-smi GPUs by core temperature.
+
+    The two tools enumerate independently -- nvidia-gpu-sensors walks RM's
+    GPU_GET_PROBED_IDS and never prints a PCI bus id -- so equal indices need not be
+    the same card, and a straight index join can attribute one GPU's memory reading to
+    another. Both report core temperature, so join on that: take the identity mapping
+    when it fits, else the unique permutation that does, else report nothing rather
+    than something wrong."""
+    if not rows or not gpus or len(rows) != len(gpus) or len(gpus) > 8:
         return {}
+    smi = [g.get("temp") for g in gpus]
+    idx = sorted(rows)
+    if any(t is None for t in smi) or any(rows[i]["core"] is None for i in idx):
+        return {}
+
+    def fits(order):
+        return all(abs(rows[r]["core"] - t) <= tol for r, t in zip(order, smi))
+
+    if not fits(idx):
+        ok = [p for p in itertools.permutations(idx) if fits(p)]
+        if len(ok) != 1:
+            return {}          # ambiguous or impossible -- do not guess
+        idx = ok[0]
+    return {g["index"]: rows[r] for g, r in zip(gpus, idx)}
+
+
+def read_gpu_extra(binary, gpus=()):
+    """Run nvidia-gpu-sensors once and align its rows to `gpus` (from nvidia-smi).
+
+    Returns None when the binary itself is unusable (missing / not root / no table),
+    so the caller can stop respawning it, versus {} when it ran but its rows could not
+    be attributed to a GPU with confidence."""
+    if not binary:
+        return None
     try:
         out = subprocess.run([binary], capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
-        return {}
-    return _parse_gpu_sensors(out)
+        return None
+    rows = _parse_gpu_sensors(out)
+    if not rows:
+        return None
+    return _align(rows, list(gpus))
 
 
 # ---- CPU temperature (sysfs hwmon) ---------------------------------------
@@ -510,14 +563,15 @@ def main():
         while True:
             width = shutil.get_terminal_size((100, 40)).columns
             gpus = read_gpu_info()
-            extra = read_gpu_extra(gpu_sensors)   # mem/hot-spot temps nvidia-smi lacks
+            extra = read_gpu_extra(gpu_sensors, gpus)  # mem/hot-spot temps nvidia-smi lacks
             if gpu_sensors and gpus:
-                if extra:
-                    gs_fails = 0
-                else:
+                if extra is None:                 # binary unusable, not merely unaligned
                     gs_fails += 1
                     if gs_fails >= 3:             # never works here — stop spawning it
                         gpu_sensors = None
+                else:
+                    gs_fails = 0
+            extra = extra or {}
             for g in gpus:
                 ex = extra.get(g["index"])
                 if not ex:

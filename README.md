@@ -87,6 +87,18 @@ If **hot spot** shows `n/a` with a note about `mmap of BAR0`, your kernel has
 `CONFIG_IO_STRICT_DEVMEM=y`; boot with `iomem=relaxed` on the kernel command line to enable it.
 (Core and memory temps do not need this.)
 
+**Build an up-to-date `nvidia-gpu-sensors`.** Builds before the
+`Core Temp | Hot Spot | Mem Temp` column order print a header that disagrees with the data they
+emit, transposing memory and hot spot. supersensor detects that (hot spot can never read below
+core temp) and corrects it, but a current build avoids the guesswork.
+
+**Memory and hot spot can read `n/a` even when the binary works.** `nvidia-gpu-sensors`
+enumerates GPUs via RM's `GPU_GET_PROBED_IDS` and prints no PCI bus id, so its row numbers are
+not nvidia-smi's indices and cannot be joined directly. supersensor matches rows to GPUs by core
+temperature instead; when several cards sit at the same temperature the match is ambiguous and
+those columns are left blank rather than risk showing one card's reading against another's. Put
+the GPUs under differing load, or wait for upstream to emit a bus id, to resolve it.
+
 ## CPU package power
 
 Best data comes from `turbostat` (part of `linux-cpupower` / `linux-tools`); supersensor streams it
