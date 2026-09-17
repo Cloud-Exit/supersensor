@@ -92,12 +92,24 @@ If **hot spot** shows `n/a` with a note about `mmap of BAR0`, your kernel has
 emit, transposing memory and hot spot. supersensor detects that (hot spot can never read below
 core temp) and corrects it, but a current build avoids the guesswork.
 
-**Memory and hot spot can read `n/a` even when the binary works.** `nvidia-gpu-sensors`
+**Memory and hot spot are matched to GPUs by a learned map.** `nvidia-gpu-sensors`
 enumerates GPUs via RM's `GPU_GET_PROBED_IDS` and prints no PCI bus id, so its row numbers are
-not nvidia-smi's indices and cannot be joined directly. supersensor matches rows to GPUs by core
-temperature instead; when several cards sit at the same temperature the match is ambiguous and
-those columns are left blank rather than risk showing one card's reading against another's. Put
-the GPUs under differing load, or wait for upstream to emit a bus id, to resolve it.
+not nvidia-smi's indices and cannot be joined directly -- on a 4x RTX PRO 6000 host here, its row
+3 is nvidia-smi's GPU 2. Joining them by index shows one card's memory temperature against
+another.
+
+supersensor instead matches rows to GPUs by core temperature, which both report. That only
+identifies a card while it sits at a temperature no other card shares, so each sample pins
+whichever cards it can and the result accumulates in `~/.cache/supersensor/rowmap.json`, keyed by
+the set of PCI bus ids present. The last row falls out by elimination. Until the map is complete
+those two columns read `n/a`; once it is, they are reused even when every card is idle and
+indistinguishable. A reading that contradicts the stored map -- cards reseated into different
+slots -- discards it and relearns.
+
+Ordinary use fills the map in, since it only needs each GPU to be busy alone once. To force it,
+put one GPU under load at a time (`CUDA_VISIBLE_DEVICES=<n>` with `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+on any GPU workload) and run supersensor between each. Set `$SUPERSENSOR_STATE` to relocate the
+cache.
 
 ## CPU package power
 
