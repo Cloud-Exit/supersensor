@@ -216,6 +216,45 @@ def _save_map(gpus, mapping):
         pass                                  # read-only fs: fall back to re-deriving
 
 
+def _canon_bus(bus):
+    """PCI id without the domain padding: nvidia-smi says 00000000:01:00.0, /proc says
+    0000:01:00.0."""
+    return bus.strip().lower().split(":", 1)[-1]
+
+
+def _driver_map(gpus):
+    """Exact row -> nvidia-smi index map from the driver, or None.
+
+    nvidia-gpu-sensors enumerates with RM's GPU_GET_PROBED_IDS, which hands back GPUs
+    in deviceInstance order -- the same number as the /dev/nvidiaN minor -- so its Nth
+    row is the GPU with minor N. /proc/driver/nvidia/gpus/<bus>/information gives
+    bus -> minor and nvidia-smi gives index -> bus, which closes the loop with no
+    guessing and no waiting for the cards to differ in temperature.
+
+    Returns None if /proc is not mounted (a container without it) or any GPU is
+    missing, leaving the temperature-matching path to cope."""
+    minors = {}
+    for info in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+        bus = _canon_bus(os.path.basename(os.path.dirname(info)))
+        try:
+            with open(info) as fh:
+                for line in fh:
+                    if line.lower().startswith("device minor"):
+                        minors[bus] = int(line.split(":", 1)[1])
+                        break
+        except (OSError, ValueError):
+            continue
+    if not minors:
+        return None
+    out = {}
+    for g in gpus:
+        minor = minors.get(_canon_bus(g.get("bus") or ""))
+        if minor is None or minor in out:
+            return None
+        out[minor] = g["index"]
+    return out if len(out) == len(gpus) else None
+
+
 def _pins(rows, gpus, tol):
     """Rows that can be tied to a GPU from this sample alone.
 
@@ -257,6 +296,19 @@ def _align(rows, gpus, tol=3.0):
     if not rows or not gpus or len(rows) != len(gpus) or len(gpus) > 8:
         return {}
 
+    exact = _driver_map(gpus)
+    if exact and sorted(exact) == sorted(rows):
+        # The driver states the order outright; only distrust it if a core temperature
+        # actively disagrees, which would mean the minor/probe-order assumption broke.
+        order = [exact[r] for r in sorted(rows)]
+        bad = any(rows[r]["core"] is not None and g_t is not None
+                  and abs(rows[r]["core"] - g_t) > tol
+                  for r, g_t in zip(sorted(rows),
+                                    [dict((g["index"], g.get("temp")) for g in gpus)[i]
+                                     for i in order]))
+        if not bad:
+            return {idx: rows[row] for row, idx in exact.items()}
+
     known = _load_map(gpus) or {}
     pins = _pins(rows, gpus, tol)
     if any(known.get(row, idx) != idx for row, idx in pins.items()):
@@ -280,8 +332,12 @@ def _align(rows, gpus, tol=3.0):
 
 
 def _unknown(gpus):
-    """GPU indices whose sensor row is not yet identified."""
-    known = set((_load_map(gpus) or {}).values())
+    """GPU indices whose sensor row is not yet identified.
+
+    The driver states the order outright where /proc is available, in which case
+    nothing is ever unknown and no learning happens at all."""
+    known = set((_driver_map(gpus) or {}).values())
+    known |= set((_load_map(gpus) or {}).values())
     return [g["index"] for g in gpus if g["index"] not in known]
 
 
