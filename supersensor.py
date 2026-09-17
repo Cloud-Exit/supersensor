@@ -273,9 +273,10 @@ def _align(rows, gpus, tol=3.0):
         learned = pins if len(set(pins.values())) == len(pins) else {}
     if learned != known:
         _save_map(gpus, learned)
-    if len(learned) != len(gpus) or set(learned) != set(rows):
-        return {}                                      # not resolved yet
-    return {idx: rows[row] for row, idx in learned.items()}
+    # Report whatever is known rather than nothing: each pin was established on its
+    # own, so a half-learned map is half useful, and readings appear card by card as
+    # the rest is worked out.
+    return {idx: rows[row] for row, idx in learned.items() if row in rows}
 
 
 def _unknown(gpus):
@@ -677,10 +678,28 @@ def build_frame(gpus, cpu, cooling, interval, width):
               if g["power"] is not None and g["power_max"] is not None else "n/a")
         fan = f"{g['fan']:.0f}%" if g["fan"] is not None else "n/a"
         hs = g.get("hotspot")
-        hs_part = ("   hotspot " + c(fmt_temp(hs), temp_color(hs))) if hs is not None else ""
+        learning = g.get("sensor_learning")
+        hs_cell = c(fmt_temp(hs), temp_color(hs)) if hs is not None \
+            else (c("learning", "yellow") if learning else None)
+        hs_part = ("   hotspot " + hs_cell) if hs_cell else ""
+        mem_cell = c("learning", "yellow") if (g["mem_temp"] is None and learning) \
+            else c(fmt_temp(g["mem_temp"]), temp_color(g["mem_temp"]))
         L.append(f"    temp {c(fmt_temp(g['temp']), temp_color(g['temp']))}"
-                 f"   mem-temp {c(fmt_temp(g['mem_temp']), temp_color(g['mem_temp']))}"
+                 f"   mem-temp {mem_cell}"
                  f"{hs_part}   fan {fan:>4}   power {pw}")
+        L.append("")
+
+    pending = [g["index"] for g in gpus if g.get("sensor_learning")]
+    if pending:
+        done = len(gpus) - len(pending)
+        L.append(f"  {c(bold('Sensor map'), 'blue')}  "
+                 f"{bar(100.0 * done / max(len(gpus), 1), 22, 'yellow')}  "
+                 f"{done}/{len(gpus)} GPUs identified"
+                 f"   {c('learning: ' + ', '.join('GPU %d' % i for i in pending), 'yellow')}")
+        L.append(c("    nvidia-gpu-sensors numbers its rows differently to nvidia-smi; a GPU is "
+                   "matched once it runs", "grey"))
+        L.append(c("    warmer than the others. Memory and hot-spot temps appear for it then, "
+                   "and are remembered.", "grey"))
         L.append("")
 
     # CPU section
@@ -750,7 +769,9 @@ def main():
     if not args.no_autolearn:
         # One-time: work out which sensor row is which GPU, then remember it. No-op
         # once the map is complete, so only the first run on a machine pays for it.
-        autolearn(gpu_sensors, quiet=once)
+        # In the live view the frame carries the progress; only speak up when there
+        # is no frame to repeat it (--once, or piped output).
+        autolearn(gpu_sensors, quiet=not once)
     # prime CPU/power deltas so the first frame shows real values, not noise
     time.sleep(min(args.interval, 0.3))
     if once and turbo.snapshot() is None:
@@ -773,7 +794,9 @@ def main():
                 else:
                     gs_fails = 0
             extra = extra or {}
+            pending = set(_unknown(gpus)) if (gpu_sensors and gpus) else set()
             for g in gpus:
+                g["sensor_learning"] = g["index"] in pending
                 ex = extra.get(g["index"])
                 if not ex:
                     continue
