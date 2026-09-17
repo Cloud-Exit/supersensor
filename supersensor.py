@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, glob, itertools, os, shutil, subprocess, sys, threading, time
+import argparse, glob, itertools, json, os, shutil, subprocess, sys, threading, time
 
 PROG = "supersensor"
 
@@ -35,11 +35,11 @@ def parse_args():
 # ---- GPU (nvidia-smi) -----------------------------------------------------
 # Full field set, then a minimal one: older drivers reject unknown query fields
 # with a non-zero exit (losing everything), so we retry with just the essentials.
-GPU_FIELDS = ["index", "name", "utilization.gpu", "memory.used", "memory.total",
+GPU_FIELDS = ["index", "name", "pci.bus_id", "utilization.gpu", "memory.used", "memory.total",
               "temperature.gpu", "temperature.memory", "power.draw", "power.limit",
               "fan.speed", "clocks.sm"]
-GPU_FIELDS_MIN = ["index", "name", "utilization.gpu", "memory.used", "memory.total",
-                  "temperature.gpu", "power.draw", "power.limit"]
+GPU_FIELDS_MIN = ["index", "name", "pci.bus_id", "utilization.gpu", "memory.used",
+                  "memory.total", "temperature.gpu", "power.draw", "power.limit"]
 
 
 def read_gpu_info():
@@ -67,6 +67,7 @@ def read_gpu_info():
             gpus.append({
                 "index": int(idx) if idx.isdigit() else len(gpus),
                 "name": d.get("name") or "GPU",
+                "bus": d.get("pci.bus_id") or "",
                 "util": num(d.get("utilization.gpu")),
                 "mem_used": num(d.get("memory.used")), "mem_total": num(d.get("memory.total")),
                 "temp": num(d.get("temperature.gpu")), "mem_temp": num(d.get("temperature.memory")),
@@ -148,31 +149,122 @@ def _untranspose(rows):
     return rows
 
 
+MAP_FILE = "rowmap.json"
+
+
+def _state_dir():
+    """Where the learned row map lives. Under sudo, prefer the invoking user's cache
+    so the map survives and stays readable outside the root session."""
+    env = os.environ.get("SUPERSENSOR_STATE")
+    if env:
+        return env
+    home = ("/home/" + os.environ["SUDO_USER"]) if os.environ.get("SUDO_USER") \
+        else os.path.expanduser("~")
+    return os.path.join(home, ".cache", "supersensor")
+
+
+def _map_key(gpus):
+    """Identify this exact set of cards, so a map is not reused across a reshuffle."""
+    return "|".join(sorted(g.get("bus") or str(g["index"]) for g in gpus))
+
+
+def _load_map(gpus):
+    try:
+        with open(os.path.join(_state_dir(), MAP_FILE)) as fh:
+            saved = json.load(fh).get(_map_key(gpus))
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(saved, dict):
+        return None
+    try:
+        return {int(row): int(idx) for row, idx in saved.items()}
+    except (TypeError, ValueError):
+        return None
+
+
+def _save_map(gpus, mapping):
+    d = _state_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, MAP_FILE)
+        try:
+            with open(path) as fh:
+                all_maps = json.load(fh)
+            if not isinstance(all_maps, dict):
+                all_maps = {}
+        except (OSError, ValueError):
+            all_maps = {}
+        all_maps[_map_key(gpus)] = {str(r): i for r, i in mapping.items()}
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(all_maps, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+        if os.environ.get("SUDO_UID"):        # keep it owned by the invoking user
+            os.chown(path, int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", -1)))
+    except OSError:
+        pass                                  # read-only fs: fall back to re-deriving
+
+
+def _pins(rows, gpus, tol):
+    """Rows that can be tied to a GPU from this sample alone.
+
+    A row pins a GPU when each is within tol of the other's core temperature and of
+    nothing else -- in practice, a card at a distinct temperature, which usually means
+    one under load. Cards sitting together at idle pin nothing, which is correct: they
+    are genuinely indistinguishable by temperature."""
+    pins = {}
+    for row, vals in rows.items():
+        core = vals["core"]
+        if core is None:
+            continue
+        near_gpu = [g for g in gpus
+                    if g.get("temp") is not None and abs(g["temp"] - core) <= tol]
+        if len(near_gpu) != 1:
+            continue
+        g = near_gpu[0]
+        near_row = [r for r, v in rows.items()
+                    if v["core"] is not None and abs(v["core"] - g["temp"]) <= tol]
+        if len(near_row) == 1:
+            pins[row] = g["index"]
+    return pins
+
+
 def _align(rows, gpus, tol=3.0):
-    """Map nvidia-gpu-sensors rows onto nvidia-smi GPUs by core temperature.
+    """Map nvidia-gpu-sensors rows onto nvidia-smi GPUs, learning the map over time.
 
     The two tools enumerate independently -- nvidia-gpu-sensors walks RM's
-    GPU_GET_PROBED_IDS and never prints a PCI bus id -- so equal indices need not be
-    the same card, and a straight index join can attribute one GPU's memory reading to
-    another. Both report core temperature, so join on that: take the identity mapping
-    when it fits, else the unique permutation that does, else report nothing rather
-    than something wrong."""
+    GPU_GET_PROBED_IDS and prints no PCI bus id -- so equal indices need not be the
+    same card, and a straight index join can show one GPU's memory against another.
+
+    Core temperature is the only quantity both report, and it identifies a card only
+    while that card sits at a distinct temperature, so a single sample rarely resolves
+    every row. Instead each sample pins whichever cards it can, the result accumulates
+    in a small cache keyed by the set of PCI bus ids, and the last row falls out by
+    elimination. Normal use -- one GPU busy at a time -- fills the map in; it is then
+    reused while the machine is idle and everything looks alike. A pin that disagrees
+    with the cache means the cards moved, so the map is relearned from scratch."""
     if not rows or not gpus or len(rows) != len(gpus) or len(gpus) > 8:
         return {}
-    smi = [g.get("temp") for g in gpus]
-    idx = sorted(rows)
-    if any(t is None for t in smi) or any(rows[i]["core"] is None for i in idx):
-        return {}
 
-    def fits(order):
-        return all(abs(rows[r]["core"] - t) <= tol for r, t in zip(order, smi))
+    known = _load_map(gpus) or {}
+    pins = _pins(rows, gpus, tol)
+    if any(known.get(row, idx) != idx for row, idx in pins.items()):
+        known = {}                                   # cards moved -- start over
+    learned = dict(known)
+    learned.update(pins)
 
-    if not fits(idx):
-        ok = [p for p in itertools.permutations(idx) if fits(p)]
-        if len(ok) != 1:
-            return {}          # ambiguous or impossible -- do not guess
-        idx = ok[0]
-    return {g["index"]: rows[r] for g, r in zip(gpus, idx)}
+    rows_left = [r for r in rows if r not in learned]
+    idx_left = [g["index"] for g in gpus if g["index"] not in learned.values()]
+    if len(rows_left) == 1 and len(idx_left) == 1:    # only one way left to assign it
+        learned[rows_left[0]] = idx_left[0]
+
+    if len(set(learned.values())) != len(learned):     # two rows on one GPU: unusable
+        learned = pins if len(set(pins.values())) == len(pins) else {}
+    if learned != known:
+        _save_map(gpus, learned)
+    if len(learned) != len(gpus) or set(learned) != set(rows):
+        return {}                                      # not resolved yet
+    return {idx: rows[row] for row, idx in learned.items()}
 
 
 def read_gpu_extra(binary, gpus=()):
