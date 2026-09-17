@@ -216,6 +216,45 @@ def _save_map(gpus, mapping):
         pass                                  # read-only fs: fall back to re-deriving
 
 
+def _canon_bus(bus):
+    """PCI id without the domain padding: nvidia-smi says 00000000:01:00.0, /proc says
+    0000:01:00.0."""
+    return bus.strip().lower().split(":", 1)[-1]
+
+
+def _driver_map(gpus):
+    """Exact row -> nvidia-smi index map from the driver, or None.
+
+    nvidia-gpu-sensors enumerates with RM's GPU_GET_PROBED_IDS, which hands back GPUs
+    in deviceInstance order -- the same number as the /dev/nvidiaN minor -- so its Nth
+    row is the GPU with minor N. /proc/driver/nvidia/gpus/<bus>/information gives
+    bus -> minor and nvidia-smi gives index -> bus, which closes the loop with no
+    guessing and no waiting for the cards to differ in temperature.
+
+    Returns None if /proc is not mounted (a container without it) or any GPU is
+    missing, leaving the temperature-matching path to cope."""
+    minors = {}
+    for info in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+        bus = _canon_bus(os.path.basename(os.path.dirname(info)))
+        try:
+            with open(info) as fh:
+                for line in fh:
+                    if line.lower().startswith("device minor"):
+                        minors[bus] = int(line.split(":", 1)[1])
+                        break
+        except (OSError, ValueError):
+            continue
+    if not minors:
+        return None
+    out = {}
+    for g in gpus:
+        minor = minors.get(_canon_bus(g.get("bus") or ""))
+        if minor is None or minor in out:
+            return None
+        out[minor] = g["index"]
+    return out if len(out) == len(gpus) else None
+
+
 def _pins(rows, gpus, tol):
     """Rows that can be tied to a GPU from this sample alone.
 
@@ -257,6 +296,19 @@ def _align(rows, gpus, tol=3.0):
     if not rows or not gpus or len(rows) != len(gpus) or len(gpus) > 8:
         return {}
 
+    exact = _driver_map(gpus)
+    if exact and sorted(exact) == sorted(rows):
+        # The driver states the order outright; only distrust it if a core temperature
+        # actively disagrees, which would mean the minor/probe-order assumption broke.
+        order = [exact[r] for r in sorted(rows)]
+        bad = any(rows[r]["core"] is not None and g_t is not None
+                  and abs(rows[r]["core"] - g_t) > tol
+                  for r, g_t in zip(sorted(rows),
+                                    [dict((g["index"], g.get("temp")) for g in gpus)[i]
+                                     for i in order]))
+        if not bad:
+            return {idx: rows[row] for row, idx in exact.items()}
+
     known = _load_map(gpus) or {}
     pins = _pins(rows, gpus, tol)
     if any(known.get(row, idx) != idx for row, idx in pins.items()):
@@ -273,14 +325,19 @@ def _align(rows, gpus, tol=3.0):
         learned = pins if len(set(pins.values())) == len(pins) else {}
     if learned != known:
         _save_map(gpus, learned)
-    if len(learned) != len(gpus) or set(learned) != set(rows):
-        return {}                                      # not resolved yet
-    return {idx: rows[row] for row, idx in learned.items()}
+    # Report whatever is known rather than nothing: each pin was established on its
+    # own, so a half-learned map is half useful, and readings appear card by card as
+    # the rest is worked out.
+    return {idx: rows[row] for row, idx in learned.items() if row in rows}
 
 
 def _unknown(gpus):
-    """GPU indices whose sensor row is not yet identified."""
-    known = set((_load_map(gpus) or {}).values())
+    """GPU indices whose sensor row is not yet identified.
+
+    The driver states the order outright where /proc is available, in which case
+    nothing is ever unknown and no learning happens at all."""
+    known = set((_driver_map(gpus) or {}).values())
+    known |= set((_load_map(gpus) or {}).values())
     return [g["index"] for g in gpus if g["index"] not in known]
 
 
@@ -677,10 +734,28 @@ def build_frame(gpus, cpu, cooling, interval, width):
               if g["power"] is not None and g["power_max"] is not None else "n/a")
         fan = f"{g['fan']:.0f}%" if g["fan"] is not None else "n/a"
         hs = g.get("hotspot")
-        hs_part = ("   hotspot " + c(fmt_temp(hs), temp_color(hs))) if hs is not None else ""
+        learning = g.get("sensor_learning")
+        hs_cell = c(fmt_temp(hs), temp_color(hs)) if hs is not None \
+            else (c("learning", "yellow") if learning else None)
+        hs_part = ("   hotspot " + hs_cell) if hs_cell else ""
+        mem_cell = c("learning", "yellow") if (g["mem_temp"] is None and learning) \
+            else c(fmt_temp(g["mem_temp"]), temp_color(g["mem_temp"]))
         L.append(f"    temp {c(fmt_temp(g['temp']), temp_color(g['temp']))}"
-                 f"   mem-temp {c(fmt_temp(g['mem_temp']), temp_color(g['mem_temp']))}"
+                 f"   mem-temp {mem_cell}"
                  f"{hs_part}   fan {fan:>4}   power {pw}")
+        L.append("")
+
+    pending = [g["index"] for g in gpus if g.get("sensor_learning")]
+    if pending:
+        done = len(gpus) - len(pending)
+        L.append(f"  {c(bold('Sensor map'), 'blue')}  "
+                 f"{bar(100.0 * done / max(len(gpus), 1), 22, 'yellow')}  "
+                 f"{done}/{len(gpus)} GPUs identified"
+                 f"   {c('learning: ' + ', '.join('GPU %d' % i for i in pending), 'yellow')}")
+        L.append(c("    nvidia-gpu-sensors numbers its rows differently to nvidia-smi; a GPU is "
+                   "matched once it runs", "grey"))
+        L.append(c("    warmer than the others. Memory and hot-spot temps appear for it then, "
+                   "and are remembered.", "grey"))
         L.append("")
 
     # CPU section
@@ -750,7 +825,9 @@ def main():
     if not args.no_autolearn:
         # One-time: work out which sensor row is which GPU, then remember it. No-op
         # once the map is complete, so only the first run on a machine pays for it.
-        autolearn(gpu_sensors, quiet=once)
+        # In the live view the frame carries the progress; only speak up when there
+        # is no frame to repeat it (--once, or piped output).
+        autolearn(gpu_sensors, quiet=not once)
     # prime CPU/power deltas so the first frame shows real values, not noise
     time.sleep(min(args.interval, 0.3))
     if once and turbo.snapshot() is None:
@@ -773,7 +850,9 @@ def main():
                 else:
                     gs_fails = 0
             extra = extra or {}
+            pending = set(_unknown(gpus)) if (gpu_sensors and gpus) else set()
             for g in gpus:
+                g["sensor_learning"] = g["index"] in pending
                 ex = extra.get(g["index"])
                 if not ex:
                     continue

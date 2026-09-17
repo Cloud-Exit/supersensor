@@ -92,27 +92,26 @@ If **hot spot** shows `n/a` with a note about `mmap of BAR0`, your kernel has
 emit, transposing memory and hot spot. supersensor detects that (hot spot can never read below
 core temp) and corrects it, but a current build avoids the guesswork.
 
-**Memory and hot spot are matched to GPUs by a learned map.** `nvidia-gpu-sensors`
-enumerates GPUs via RM's `GPU_GET_PROBED_IDS` and prints no PCI bus id, so its row numbers are
-not nvidia-smi's indices and cannot be joined directly -- on a 4x RTX PRO 6000 host here its row
-2 is nvidia-smi's GPU 1. Joining by index shows one card's memory temperature against another.
+**Memory and hot spot are matched to GPUs via the driver.** `nvidia-gpu-sensors` enumerates
+GPUs with RM's `GPU_GET_PROBED_IDS` and prints no PCI bus id, so its row numbers are not
+nvidia-smi's indices -- on a 4x RTX PRO 6000 host here its row 2 is nvidia-smi's GPU 1. Joining
+them by index shows one card's memory temperature against another.
 
-supersensor matches rows to GPUs by core temperature, which both report. That identifies a card
-only while it sits at a temperature no other card shares, so each sample pins whichever cards it
-can, the result accumulates in `~/.cache/supersensor/rowmap.json` keyed by the set of PCI bus ids
-present, and the last row falls out by elimination. Until a card is recognised its memory and hot
-spot read `n/a`; once the map is complete it is reused even when every card is idle and
-indistinguishable. A reading that contradicts the map -- cards moved between slots -- discards it
-and relearns.
+RM returns GPUs in `deviceInstance` order, which is the `/dev/nvidiaN` minor, so the Nth row is
+the GPU with minor N. `/proc/driver/nvidia/gpus/<bus>/information` gives bus -> minor and
+nvidia-smi gives index -> bus, which pins every row exactly, immediately, with the cards in use
+and at whatever temperature they happen to be. A core temperature that flatly disagrees is taken
+as the assumption having broken, and the fallback below takes over.
 
-Uneven load during ordinary use fills the map in on its own; each GPU only has to be busier than
-the others once. On startup supersensor also tries to force it, loading each unrecognised GPU
-briefly via `stress.py`, which needs a CUDA-capable torch on the monitoring host -- often absent
-even on a machine that runs GPUs, in which case it says so and falls back to learning passively.
-`--no-autolearn` skips that entirely; `$SUPERSENSOR_STATE` relocates the cache.
-
-Note that a `sudo supersensor` run creates the cache directory; it is handed back to the invoking
-user so later unprivileged runs can still write it.
+Without `/proc/driver/nvidia` -- a container that does not mount it -- supersensor falls back to
+matching rows by core temperature, which only distinguishes a card while it sits at a temperature
+no other card shares. Each sample then pins whichever cards it can, the result accumulates in
+`~/.cache/supersensor/rowmap.json` keyed by the set of PCI bus ids present, and the last row
+falls out by elimination. Unidentified cards show `learning` and a progress line until their turn
+comes; identified ones show real readings straight away. On startup supersensor will also load
+each unidentified GPU briefly via `stress.py` to force the issue, if a CUDA-capable torch is
+present -- often it is not, even on a machine running GPUs, and it says so rather than waiting.
+`--no-autolearn` skips that; `$SUPERSENSOR_STATE` relocates the cache.
 
 ## CPU package power
 
