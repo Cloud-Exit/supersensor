@@ -286,6 +286,23 @@ class _FdinfoBusy:
         return max(0.0, min(100.0, 100.0 * (ns - prev) / ((t - pt) * 1e9)))
 
 
+def _power_watts(uw):
+    """MicroWatts from sysfs -> Watts, repairing a 32-bit underflow.
+
+    Some amdgpu/SMU combinations publish a signed counter through an unsigned attribute,
+    so a value a hair below zero arrives as ~4294967295 (observed: 4294967235, which is
+    -61 uW). Read literally that is 4295W -- larger than the card's own power cap, which
+    is the giveaway. Anything above a plausible ceiling is therefore reinterpreted as the
+    signed value it was meant to be."""
+    if uw > 100_000_000:                      # > 100W in uW: past any real board power
+        signed = uw - 2 ** 32
+        if abs(signed) < 100_000_000:
+            # A hair below zero is just counter jitter; report it as 0 rather than
+            # letting it reach the frame as "-0W".
+            return max(0.0, signed) / 1e6
+    return uw / 1e6
+
+
 def _hwmon_temp(hw, wanted):
     """Temperature in C for the temp channel whose label matches `wanted`.
 
@@ -346,12 +363,16 @@ def read_amd_sysfs(busy=None):
             "fan_unit": "rpm",
         }
         if hw:
+            # power1_average where the instantaneous counter is absent -- some SMU
+            # firmware exposes only the averaged one, which is what rocm-smi reports.
             pw = _read_int(os.path.join(hw, "power1_input"))
-            cap = _read_int(os.path.join(hw, "power1_cap"))
+            if pw is None:
+                pw = _read_int(os.path.join(hw, "power1_average"))
             if pw is not None and pw >= 0:
-                g["power"] = pw / 1e6
-            if cap:
-                g["power_max"] = cap / 1e6
+                g["power"] = _power_watts(pw)
+            cap = _read_int(os.path.join(hw, "power1_cap"))
+            if cap and cap > 0:
+                g["power_max"] = _power_watts(cap)
             g["fan"] = _read_int(os.path.join(hw, "fan1_input"))
             sclk = _read_int(os.path.join(hw, "freq1_input"))
             if sclk:
@@ -904,19 +925,30 @@ def read_gpu_extra(binary, gpus=()):
 
 # ---- CPU temperature (sysfs hwmon) ---------------------------------------
 def read_cpu_temp():
-    """Representative CPU package temp in C from sysfs (host-mounted /sys in Docker)."""
-    preferred, fallback = [], []
+    """Representative CPU package temp in C from sysfs (host-mounted /sys in Docker).
+
+    CPU hwmon drivers are matched by name first. Failing that, sensor name is the only
+    guide, and it is a weak one: on an APU the CPU and GPU share a die, so falling back
+    to "any hwmon that is not a GPU" would pick up a disk, network card or the Asus EC
+    and report it as the CPU temperature. Preference therefore runs CPU driver ->
+    CPU-ish channel label -> any non-GPU sensor."""
+    preferred, fallback, any_valid = [], [], []
     for hw in glob.glob("/sys/class/hwmon/hwmon*"):
         try:
             name = open(os.path.join(hw, "name")).read().strip()
         except OSError:
             continue
         is_cpu = name in ("k10temp", "coretemp", "zenpower", "cpu_thermal", "cpu-thermal")
-        is_gpu = name in ("amdgpu", "nouveau", "nvidia")
+        is_gpu = name in ("amdgpu", "radeon", "nouveau", "nvidia")
+        # A name that says what it is beats a guess from the label: "nvme" or
+        # "mt7925_phy0" is never the CPU.
+        looks_cpu = any(k in name for k in ("cpu", "core", "k10", "zen", "soc"))
         for tf in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
             try:
                 val = int(open(tf).read().strip()) / 1000.0
             except (OSError, ValueError):
+                continue
+            if val <= 0:
                 continue
             label = ""
             try: label = open(tf.replace("_input", "_label")).read().strip()
@@ -925,11 +957,50 @@ def read_cpu_temp():
                 preferred.append(val)
             elif is_cpu:
                 fallback.append(val)
-            elif not is_gpu and val > 0:
+            elif is_gpu:
+                continue                       # counted in the GPU section instead
+            elif looks_cpu:
                 fallback.append(val)
+            else:
+                any_valid.append(val)
     if preferred: return max(preferred)
     if fallback:  return max(fallback)
+    if any_valid: return max(any_valid)
     return None
+
+
+# ---- system memory (/proc/meminfo) ---------------------------------------
+def read_meminfo():
+    """System memory from /proc/meminfo as a dict of byte counts, {} if unavailable.
+
+    "used" is total - available rather than total - free, so page cache counts as
+    available instead of used: meminfo's MemFree excludes reclaimable cache, which on a
+    busy host makes a healthy machine look full. MemAvailable is the kernel's own
+    estimate of what a new workload could get without swapping, and is what free(1)
+    reports in its "used" column."""
+    vals = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    try:
+                        vals[parts[0][:-1]] = float(parts[1]) * 1024.0   # kB -> bytes
+                    except ValueError:
+                        pass
+    except OSError:
+        return {}
+    total = vals.get("MemTotal")
+    avail = vals.get("MemAvailable")
+    if avail is None:                       # pre-3.14 kernels have no MemAvailable
+        avail = (vals.get("MemFree") or 0.0) + vals.get("Buffers", 0.0) + vals.get("Cached", 0.0)
+    if not total:
+        return {}
+    mem = {"used": max(0.0, total - avail), "total": total, "available": max(0.0, avail)}
+    if vals.get("SwapTotal"):
+        mem["swap_total"] = vals["SwapTotal"]
+        mem["swap_used"] = max(0.0, vals["SwapTotal"] - (vals.get("SwapFree") or 0.0))
+    return mem
 
 
 # ---- Aquacomputer High Flow Next (sysfs hwmon) ---------------------------
@@ -1154,7 +1225,7 @@ def core_grid(cores, width):
 
 
 # ---- frame ----------------------------------------------------------------
-def build_frame(gpus, cpu, cooling, interval, width):
+def build_frame(gpus, cpu, cooling, mem, interval, width):
     L = []
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     ncpu = len(cpu["cores"])
@@ -1251,6 +1322,22 @@ def build_frame(gpus, cpu, cooling, interval, width):
         wtxt = c("%.1fC" % w, temp_color(w)) if w is not None else c("n/a", "grey")
         fltxt = c("%.1f L/h" % fl, "cyan") if fl is not None else c("n/a", "grey")
         L.append(f"  {c(bold('Coolant'), 'blue')}  water {wtxt}   flow {fltxt}")
+
+    # System memory (/proc/meminfo)
+    mused, mtot, swused, swtot = (mem.get("used"), mem.get("total"),
+                                  mem.get("swap_used"), mem.get("swap_total"))
+    if mtot:
+        f = mused / mtot if mtot else None
+        L.append("")
+        L.append(f"  {c(bold('Memory'), 'blue')}  "
+                 f"{bar(None if f is None else f * 100, 22, frac_color(f))} "
+                 f"{(f * 100) if f is not None else 0:3.0f}%"
+                 f"   {c('%.1f / %.1f GiB' % (mused / 2**30, mtot / 2**30), 'grey')}"
+                 + (f"   swap {c('%.1f / %.1f GiB' % (swused / 2**30, swtot / 2**30), 'cyan')}"
+                    if swtot else f"   swap {c('none', 'grey')}"))
+        if "available" in mem:
+            L.append(c("    %.1f GiB used of %.1f GiB, %.1f GiB available"
+                       % (mused / 2**30, mtot / 2**30, mem["available"] / 2**30), "grey"))
     L.append("")
 
     # total power: sum of GPU board power + CPU package power
@@ -1337,7 +1424,8 @@ def main():
             cpu = {"usage": agg, "cores": cores, "temp": read_cpu_temp(),
                    "power": pkg_w, "cores_power": cor_w, "mhz": mhz}
             cooling = {"water": water, "flow": flow}
-            frame = build_frame(gpus, cpu, cooling, args.interval, width)
+            mem = read_meminfo()
+            frame = build_frame(gpus, cpu, cooling, mem, args.interval, width)
             if once:
                 print("\n".join(frame))
                 break

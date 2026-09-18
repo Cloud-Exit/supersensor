@@ -271,6 +271,67 @@ def main():
         finally:
             m._fdinfo_engine_ns, m._canon_bus = real_ns, real_canon
 
+        print("power underflow repair (unsigned sysfs counter carrying a signed value):")
+        check(abs(m._power_watts(215000000) - 215.0) < 1e-9, "a normal reading is unchanged")
+        check(abs(m._power_watts(4294967235)) < 1e-6,
+              "4294967235 uW (-61 uW) is ~0W, not 4295W (%s)" % m._power_watts(4294967235))
+        check(abs(m._power_watts(4294967295)) < 1e-6, "-1 uW does not read as 4295W")
+        check(m._power_watts(4294967235) >= 0, "no -0W reaches the frame")
+        check(abs(m._power_watts(600000000) - 600.0) < 1e-9,
+              "a genuine 600W board is not mistaken for a negative")
+
+        print("CPU temp ignores GPU/disk sensors and prefers a CPU driver:")
+        real_glob_hw = m.glob.glob
+        try:
+            fsroot = os.path.join(root, "fakehw")
+            for name, val in (("nvme", 38000), ("mt7925_phy0", 44000), ("amdgpu", 99000)):
+                d = os.path.join(fsroot, name)
+                mk(os.path.join(d, "name"), name)
+                mk(os.path.join(d, "temp1_input"), val)
+            names = sorted(os.listdir(fsroot))
+            m.glob = type("G", (), {"glob": staticmethod(
+                lambda pat, *a, **k: ([os.path.join(fsroot, n) for n in names]
+                                      if pat == "/sys/class/hwmon/hwmon*"
+                                      else real_glob_hw(pat, *a, **k)))})()
+            got = m.read_cpu_temp()
+            # amdgpu is a GPU and must not win; the hottest remaining sensor is the NIC.
+            check(got == 44.0, "%s: GPU sensor excluded, falls back to a real sensor (%s)"
+                  % ("read_cpu_temp", got))
+            # A disk alone must not be mistaken for the CPU either.
+            os.remove(os.path.join(fsroot, "mt7925_phy0", "temp1_input"))
+            check(m.read_cpu_temp() == 38.0, "the only remaining sensor is used (%s)"
+                  % m.read_cpu_temp())
+            # The real regression: a CPU-ish sensor alongside a *hotter* disk. The old
+            # code lumped both into one list and took max(), reporting the 70C nvme as
+            # the CPU temperature instead of the 30C SoC sensor.
+            d = os.path.join(fsroot, "soc_thermal")
+            mk(os.path.join(d, "name"), "soc_thermal")
+            mk(os.path.join(d, "temp1_input"), 30000)
+            mk(os.path.join(fsroot, "nvme", "temp1_input"), 70000)
+            names = sorted(os.listdir(fsroot))
+            check(m.read_cpu_temp() == 30.0,
+                  "a CPU-ish sensor beats a hotter disk (%s)" % m.read_cpu_temp())
+            # And a real CPU driver beats both.
+            d = os.path.join(fsroot, "k10temp")
+            mk(os.path.join(d, "name"), "k10temp")
+            mk(os.path.join(d, "temp1_input"), 25000)
+            mk(os.path.join(d, "temp1_label"), "Tctl")
+            names = sorted(os.listdir(fsroot))
+            check(m.read_cpu_temp() == 25.0, "a CPU hwmon driver wins outright")
+        finally:
+            m.glob = type("G", (), {"glob": staticmethod(real_glob_hw)})()
+
+        print("system memory (/proc/meminfo):")
+        mem = m.read_meminfo()
+        check(bool(mem) and mem["total"] > 0, "meminfo parsed (%s)" % (sorted(mem) or "empty"))
+        if mem:
+            check(mem["used"] + mem["available"] <= mem["total"] + 1,
+                  "used is total-available, so it never exceeds total")
+            check(mem["used"] < mem["total"], "a live host is not reported as 100% used")
+            check(mem.get("swap_total", 0) >= mem.get("swap_used", 0), "swap used <= total")
+        else:
+            check(False, "no meminfo")
+
         # supersensor and stress.py must agree on which index is which card, or every
         # label in a stress log names the wrong GPU. stress.py reads the real /sys, so
         # point supersensor back at the real /sys too.
