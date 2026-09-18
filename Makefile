@@ -12,15 +12,21 @@ TIMEOUT  ?= 300
 GPUS     ?= all
 ARGS     ?=
 
-.PHONY: monitor install install-gpu-sensors uninstall \
+.PHONY: monitor install install-gpu-sensors uninstall test \
         build run monitor-docker clean
 
 # ===== supersensor (primary): live GPU + CPU + coolant monitor =============
 # Runs on the HOST (pure stdlib, no container). Every source degrades to n/a if
-# unsupported. sudo unlocks CPU package power (turbostat/RAPL) and GPU memory
-# temps (nvidia-gpu-sensors); everything else works without it.
+# unsupported. GPU cards from NVIDIA and AMD are autodetected. sudo unlocks CPU
+# package power (turbostat/RAPL) and NVIDIA memory temps (nvidia-gpu-sensors);
+# everything else works without it.
 monitor:
 	sudo python3 supersensor.py $(ARGS)
+
+# Fixture checks for the AMD / NVIDIA-sysfs readers. Builds a fake sysfs tree, so
+# an AMD card (R9700 included) is exercised even on an NVIDIA-only host.
+test:
+	python3 test_amd.py
 
 # Install as the `supersensor` command in $(BINDIR).
 install:
