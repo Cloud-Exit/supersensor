@@ -22,6 +22,8 @@ and power, the CPU shows aggregate + per-core usage, and the loop shows coolant 
   **hot spot**, fan, power draw/limit. Works for NVIDIA and AMD cards at the same time.
 - **CPU** — aggregate usage, average frequency, package temp, **package power** (+ core power),
   and a **per-core usage grid** (index · bar · %).
+- **Memory** — system RAM used/total, a usage bar, and swap. "Used" is `total - MemAvailable`,
+  so reclaimable page cache is not counted as used (this is what `free`'s used column reports).
 - **Coolant** — water temperature and flow rate (L/h), if a supported loop sensor is present.
 - **Total power** — sum of GPU board power + CPU package power.
 
@@ -39,6 +41,7 @@ and power, the CPU shows aggregate + per-core usage, and the loop shows coolant 
 | `turbostat` | CPU **package**/core power, avg freq | `turbostat` + root + MSR | falls back to RAPL |
 | RAPL (`/sys/class/powercap`) | CPU package power | powercap + root | power shows `n/a` |
 | `/proc/stat` | CPU usage (aggregate + per-core) | Linux | usage shows `n/a` |
+| `/proc/meminfo` | system RAM used/total + swap | Linux | Memory section is hidden |
 | hwmon (`/sys/class/hwmon`) | CPU package temp | `lm-sensors`/kernel | temp shows `n/a` |
 | Aquacomputer `highflownext` | coolant temp + flow | `aquacomputer` kernel module | Coolant section is hidden |
 
@@ -96,6 +99,12 @@ card the first one's numbers.
 
 AMD needs none of the row-alignment machinery the NVIDIA memory/hot-spot path uses: sysfs is exact,
 so AMD never shows `learning`.
+
+Some SMU/firmware combinations publish a signed power counter through an unsigned sysfs attribute,
+so a value a hair below zero arrives as `4294967235`. Read literally that is 4295 W — larger than the
+card's own cap — so anything past a plausible board power is reinterpreted as the signed value it
+was meant to be, and reported as ~0 W instead. Where only `power1_average` exists (some firmware
+exposes no instantaneous counter), that is used instead.
 
 `--vendor nvidia` or `--vendor amd` restricts collection to one vendor; the default `auto` detects
 both. The filter also scopes the one-time sensor-row learning, so `--vendor amd` on a mixed host
