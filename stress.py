@@ -75,7 +75,11 @@ def read_gpu_temps():
         n = len([d for d in _display_devices()
                  if _vendor(d) == "0x10de" and _driver(d) in ("nvidia", "nouveau")])
     for dev in _display_devices():
-        if _vendor(dev) != "0x1002":
+        # Same driver filter as the NVIDIA reservation above: read_amd_sysfs only takes
+        # amdgpu/radeon, so an AMD card handed to vfio-pci (or with no driver) must not
+        # consume a slot -- otherwise every later AMD index shifts by one and the log
+        # names the wrong card, which is exactly what that reservation exists to avoid.
+        if _vendor(dev) != "0x1002" or _driver(dev) not in ("amdgpu", "radeon"):
             continue
         edge = mem = None
         for hw in glob.glob(os.path.join(dev, "hwmon", "hwmon*")):
