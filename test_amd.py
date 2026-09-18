@@ -4,7 +4,7 @@
 Builds a throwaway sysfs-shaped tree (real symlinks, as the kernel has) and points the
 module's path roots at it, so the readers are exercised on cards that are not present --
 an RX 9700 AI PRO among them -- without needing the hardware."""
-import importlib.util, glob as globmod, os, shutil, sys, tempfile
+import importlib.util, glob as globmod, os, re, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -245,7 +245,7 @@ def main():
             clock[0] += 1.0
             check(b.update(counter["ns"]) is None, "counter reset is not negative")
         finally:
-            m.time = type("T", (), {"monotonic": staticmethod(real_mono)})()
+            m.time = time
 
         # The scan is keyed by canonical bus and covers every card in one walk.
         print("fdinfo scan maps cards by bus:")
@@ -280,19 +280,105 @@ def main():
             real_temps = stress()
             m.glob = globmod
             real_gpus = {g["index"]: g for g in m.read_gpus()}
-            # stress.py only reports cards it can read a temperature for, so every index
-            # it emits must exist in supersensor's list; the point is that the AMD card
-            # lands on the same index in both, not that the sets are equal.
-            check(bool(real_temps) and set(real_temps) <= set(real_gpus),
-                  "stress.py indices %s are a subset of supersensor's %s"
-                  % (sorted(real_temps), sorted(real_gpus)))
-            check(all(real_gpus[i]["vendor"] == "amd" for i in real_temps),
-                  "stress.py numbers AMD exactly where supersensor does")
-            check(all(abs(real_temps[i][0] - real_gpus[i]["temp"]) < 1.5
-                      for i in real_temps if real_gpus[i]["temp"] is not None),
-                  "and reports that same card's temperature")
+            # stress.py reports whatever it can read a temperature for -- NVIDIA cards
+            # too whenever nvidia-smi works -- so compare the AMD subset, which is the
+            # numbering that can actually diverge. Asserting on every sampled card would
+            # only hold on the host this was written on.
+            amd_idx = [i for i, g in real_gpus.items() if g["vendor"] == "amd"]
+            amd_sampled = [i for i in real_temps if i in amd_idx]
+            if not amd_idx:
+                print("  skip  no AMD cards on this host")
+            else:
+                check(bool(amd_sampled), "stress.py sampled the AMD card(s) %s" % amd_idx)
+                check(all(i in real_gpus for i in real_temps),
+                      "every stress.py index %s exists in supersensor's %s"
+                      % (sorted(real_temps), sorted(real_gpus)))
+                check(all(abs(real_temps[i][0] - real_gpus[i]["temp"]) < 1.5
+                          for i in amd_sampled if real_gpus[i]["temp"] is not None),
+                      "stress.py reports the same AMD card's temperature")
         except Exception as err:
             check(False, "stress.py reader raised: %r" % err)
+
+        print("_pci_display_devices is enumerated once, not twice:")
+        real_disp2 = m._pci_display_devices
+        calls = []
+        try:
+            def counting(*a, **k):
+                calls.append(1)
+                return real_disp2(*a, **k)
+            m._pci_display_devices = counting
+            m.read_amd_sysfs()
+            check(len(calls) == 1, "one enumeration per read_amd_sysfs, got %d" % len(calls))
+        finally:
+            m._pci_display_devices = real_disp2
+
+        print("pci.ids subsystem lookup is reachable (regression: it was dead code):")
+        # Vendor lines sit at column 0, so a tab-prefixed match never fired; and a
+        # comment line at column 0 cleared in_v, hiding every device below it.
+        board = m._pci_name(0x1002, 0x7550, 0x1da2, 0xe490)
+        check(board is not None and "Sapphire" in board,
+              "board name resolves, not the chip name (%r)" % board)
+        check(m._pci_name(0x1002, 0x7550, 0x1849, 0x5403) != board,
+              "a different subsystem yields a different name")
+        check("Navi 48" in (m._pci_name(0x1002, 0x7551, 0x1da2, 0xe490) or ""),
+              "an unknown subsystem still falls back to the chip name")
+        # 7550 sits below a mid-vendor comment block; if comments cleared in_v it would
+        # be missed. Assert the deep entry that the comment bug used to hide.
+        deep = m._pci_name(0x1002, 0x7550, 0x1458, 0x2437)
+        check(deep is not None and "9070" in deep, "an entry below a comment resolves (%r)" % deep)
+
+        print("vendor tag fits the width budget:")
+        strip_ansi = lambda s: re.sub(r"\x1b\[[0-9;]*m", "", s)
+        gg = {"index": 0, "name": "Navi 48 XTX [Sapphire Pulse Radeon RX 9070 XT]",
+              "vendor": "amd", "util": 3.0, "mem_used": 100.0, "mem_total": 200.0,
+              "temp": 42.0, "mem_temp": 42.0, "hotspot": 46.0, "power": None,
+              "power_max": None, "fan": 896, "clock": 41.0, "fan_unit": "rpm"}
+        cpu_stub = {"usage": 1.0, "cores": [], "temp": 50.0, "power": 59.0,
+                    "cores_power": None, "mhz": None}
+
+        def frame_for(gpu, w):
+            """build_frame gained a `mem` argument after this test was written; accept
+            either arity so it runs on both sides of that change."""
+            try:
+                return m.build_frame([gpu], cpu_stub, {}, {}, 1.0, w)
+            except TypeError:
+                return m.build_frame([gpu], cpu_stub, {}, 1.0, w)
+
+        for w in (40, 60, 80):
+            line = strip_ansi([l for l in frame_for(gg, w) if "GPU 0" in strip_ansi(l)][0])
+            check(len(line) <= w, "width %d: header is %d chars" % (w, len(line)))
+            check("[amd]" in line, "width %d: the vendor tag is still shown" % w)
+        # A card with no vendor must not have its name shortened needlessly.
+        gg2 = dict(gg, vendor=None)
+        line = strip_ansi([l for l in frame_for(gg2, 80) if "GPU 0" in strip_ansi(l)][0])
+        check(line.endswith("]") and "[" not in line.split("GPU 0")[1][:2],
+              "no tag, no wasted budget (%r)" % line[-20:])
+
+        print("stress.py reserves only cards supersensor actually lists:")
+        # A vfio-bound NVIDIA card and a driverless one are excluded by supersensor, so
+        # reserving a slot for them would shift every AMD index by two.
+        stress = load_stress_reader()
+        real_disp = stress.__globals__["_display_devices"]
+        real_vend, real_drv = stress.__globals__["_vendor"], stress.__globals__["_driver"]
+        real_glob_stress = globmod.glob
+        fake = {"0000:01:00.0": ("0x10de", "nvidia"),      # listed
+                "0000:02:00.0": ("0x10de", "vfio-pci"),    # excluded
+                "0000:03:00.0": ("0x10de", ""),            # excluded (no driver)
+                "0000:79:00.0": ("0x1002", "amdgpu")}
+        try:
+            ns = stress.__globals__
+            ns["_display_devices"] = lambda: sorted(fake)
+            ns["_vendor"] = lambda d: fake[d][0]
+            ns["_driver"] = lambda d: fake[d][1]
+            # nvidia-smi dead, every amdgpu hwmon unreadable -> indices still reserved
+            ns["subprocess"].run = lambda *a, **k: (_ for _ in ()).throw(OSError())
+            ns["glob"].glob = lambda p: [] if "hwmon" in p else real_glob_stress(p)
+            temps = stress()
+            check(list(temps) == [1], "one nvidia card listed -> AMD is index 1, got %s"
+                  % sorted(temps))
+        finally:
+            ns["_display_devices"], ns["_vendor"], ns["_driver"] = real_disp, real_vend, real_drv
+            ns["glob"].glob = real_glob_stress
 
         print("\n%d check(s) failed" % len(fails))
         return 1 if fails else 0

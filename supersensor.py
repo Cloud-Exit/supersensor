@@ -134,11 +134,18 @@ def _pci_name_uncached(vendor, device, subvendor=None, subdevice=None):
         for path in _PCI_IDS_FILES:
             try:
                 with open(path, "r", errors="replace") as fh:
-                    want_v = "\t%04x  " % vendor
+                    # Vendor lines sit at column 0; device lines are tab-indented and
+                    # subsystem lines tab-tab-indented. A tab-prefixed want_v would never
+                    # match and the whole subsystem pass would be dead code.
+                    want_v = "%04x  " % vendor
                     want_d = "\t%04x  " % device
                     in_v = in_d = False
                     for line in fh:
-                        if not line.strip():
+                        if not line.strip() or line.startswith("#"):
+                            # Comments sit at column 0 *inside* a vendor block, so
+                            # treating them as vendor lines would clear in_v and skip
+                            # every device after them -- exactly what happens to the
+                            # ATI block partway down, hiding all subsystems below it.
                             continue
                         if not line[0].isspace():          # vendor line
                             in_v = line.startswith(want_v)
@@ -317,10 +324,12 @@ def read_amd_sysfs(busy=None):
     rather than reported raw."""
     busy = busy if busy is not None else {}
     gpus = []
+    # One enumeration, reused for both passes: each entry globs every PCI device and
+    # reads several attribute files, so walking twice doubles that for no gain.
+    amd = [row for row in _pci_display_devices()
+           if row[2] == VENDOR_AMD and row[6] in ("amdgpu", "radeon")]
     cards = []          # (devpath, bus, drm card) for cards lacking gpu_busy_percent
-    for devpath, bus, vendor, device, subv, subd, driver in _pci_display_devices():
-        if vendor != VENDOR_AMD or driver not in ("amdgpu", "radeon"):
-            continue
+    for devpath, bus, vendor, device, subv, subd, driver in amd:
         card = _drm_for(devpath)
         if card is not None and _read_int(
                 os.path.join(card, "device", "gpu_busy_percent")) is None:
@@ -329,9 +338,7 @@ def read_amd_sysfs(busy=None):
     fdinfo = _fdinfo_engine_ns([c for _, _, c in cards]) if cards else {}
     fallback = {bus: fdinfo.get(_canon_bus(bus)) for _, bus, _ in cards}
 
-    for devpath, bus, vendor, device, subv, subd, driver in _pci_display_devices():
-        if vendor != VENDOR_AMD or driver not in ("amdgpu", "radeon"):
-            continue
+    for devpath, bus, vendor, device, subv, subd, driver in amd:
         hw = _hwmon_for(devpath)
         name = _pci_name(vendor, device, subv, subd) or "AMD GPU"
         g = {
@@ -1167,11 +1174,14 @@ def build_frame(gpus, cpu, cooling, interval, width):
                    "driver loaded, /sys mounted?)", "red"))
     for g in gpus:
         prefix = "  GPU %d  " % g["index"]          # visible prefix width (no ANSI)
-        avail = max(12, width - len(prefix) - 1)
+        tag = " [%s]" % g["vendor"] if g.get("vendor") else ""
+        vtag = c(tag, "grey") if tag else ""
+        # The tag is appended after the name, so it has to come out of the name's budget
+        # or the header line runs past the terminal width by the tag's length.
+        avail = max(12, width - len(prefix) - 1 - len(tag))
         name = g["name"]
         if len(name) > avail: name = name[:avail - 1] + "…"
         label = c(bold("GPU " + str(g["index"])), "blue")
-        vtag = c(" [%s]" % g["vendor"], "grey") if g.get("vendor") else ""
         L.append("  " + label + "  " + name + vtag)
 
         clk = ("%.0fMHz" % g["clock"]) if g["clock"] is not None else "n/a"

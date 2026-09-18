@@ -28,6 +28,14 @@ def _vendor(dev):
     except OSError: return ""
 
 
+def _driver(dev):
+    """Bound driver name, or "" if the card has none (including a vfio-pci binding)."""
+    try:
+        return os.path.basename(os.path.realpath(os.path.join(dev, "driver")))
+    except OSError:
+        return ""
+
+
 def read_gpu_temps():
     """Return {gpu_index: (gpu_temp_C, mem_temp_C)} for whatever GPUs are present.
 
@@ -60,8 +68,12 @@ def read_gpu_temps():
         n = max(n, int(idx) + 1)
     if n == 0:
         # nvidia-smi gone: supersensor still lists these cards from sysfs, so reserve
-        # their slots to keep the two numberings identical.
-        n = len([d for d in _display_devices() if _vendor(d) == "0x10de"])
+        # their slots to keep the two numberings identical. The driver filter matters:
+        # supersensor excludes vfio-pci and driverless cards, so counting every
+        # NVIDIA-vendor display device would reserve slots it never fills and shift AMD
+        # by that many -- the exact mislabelling this reservation exists to prevent.
+        n = len([d for d in _display_devices()
+                 if _vendor(d) == "0x10de" and _driver(d) in ("nvidia", "nouveau")])
     for dev in _display_devices():
         if _vendor(dev) != "0x1002":
             continue
