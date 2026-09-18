@@ -11,18 +11,50 @@ def parse_args():
     return p.parse_args()
 
 def read_gpu_temps():
-    """Return {gpu_index: (gpu_temp_C, mem_temp_C)} via nvidia-smi (always present in NGC images)."""
-    out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,temperature.gpu,temperature.memory",
-         "--format=csv,noheader,nounits"],
-        capture_output=True, text=True, check=True).stdout
+    """Return {gpu_index: (gpu_temp_C, mem_temp_C)} for whatever GPUs are present.
+
+    NVIDIA comes from nvidia-smi (always present in NGC images). AMD has no such tool
+    guaranteed, so it is read from the amdgpu hwmon nodes, which report edge/junction/mem
+    labelled channels. Cards from both vendors are returned in one dict, AMD numbered
+    after NVIDIA, matching supersensor's own ordering."""
+    res = {}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,temperature.gpu,temperature.memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        out = ""
     def f(x):
         try: return float(x)
         except ValueError: return None  # "N/A"
-    res = {}
+    n = 0
     for line in out.strip().splitlines():
-        idx, g, m = [p.strip() for p in line.split(",")]
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            continue
+        idx, g, m = parts
         res[int(idx)] = (f(g), f(m))
+        n = max(n, int(idx) + 1)
+    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        try:
+            if open(os.path.join(dev, "vendor")).read().strip() != "0x1002":
+                continue
+            if open(os.path.join(dev, "class")).read().strip()[:4] != "0x03":
+                continue
+        except OSError:
+            continue
+        edge = mem = None
+        for hw in glob.glob(os.path.join(dev, "hwmon", "hwmon*")):
+            for tf in glob.glob(os.path.join(hw, "temp*_input")):
+                try: lab = open(tf.replace("_input", "_label")).read().strip()
+                except OSError: continue
+                try: val = int(open(tf).read().strip()) / 1000.0
+                except (OSError, ValueError): continue
+                if lab == "edge": edge = val
+                elif lab == "mem": mem = val
+        res[n] = (edge, mem)
+        n += 1
     return res
 
 def read_cpu_temp():

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-import argparse, glob, itertools, json, os, shutil, subprocess, sys, threading, time
+import argparse, glob, itertools, json, os, re, shutil, subprocess, sys, threading, time
 
 PROG = "supersensor"
+
+# Vendors we know how to read. Everything is optional and detected at runtime, so a
+# machine with one vendor, the other, or both works with no configuration.
+VENDOR_NVIDIA = 0x10DE
+VENDOR_AMD = 0x1002
 
 # ---- ANSI helpers ---------------------------------------------------------
 RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
@@ -21,8 +26,9 @@ def bold(text):
 def parse_args():
     p = argparse.ArgumentParser(
         prog=PROG,
-        description="supersensor: mini-nvtop live monitor — GPU (nvidia-smi), CPU usage/power "
-                    "(turbostat/RAPL), and Aquacomputer High Flow Next coolant temp + flow")
+        description="supersensor: mini-nvtop live monitor — GPU (NVIDIA nvidia-smi, "
+                    "auto-detected AMD), CPU usage/power (turbostat/RAPL), and "
+                    "Aquacomputer High Flow Next coolant temp + flow")
     p.add_argument("--interval", type=float, default=1.0, help="refresh interval in seconds (default: 1)")
     p.add_argument("--once", action="store_true", help="print a single frame and exit")
     p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
@@ -32,7 +38,307 @@ def parse_args():
     p.add_argument("--no-autolearn", action="store_true",
                    help="skip the one-time per-GPU load used to identify which sensor row "
                         "belongs to which GPU (those columns stay blank until it runs)")
+    p.add_argument("--vendor", choices=("auto", "nvidia", "amd"), default="auto",
+                   help="limit GPU collection to one vendor (default: auto-detect both)")
     return p.parse_args()
+
+
+# ---- PCI discovery --------------------------------------------------------
+# Both vendors are found by walking /sys/bus/pci, which exists wherever the GPUs do
+# -- including a container with /sys mounted and no vendor userspace at all. Display
+# class (0x03) covers VGA and 3D controllers; audio/USB functions of a card are 0x04
+# and 0x0c and are filtered out by it.
+_PCI_IDS_FILES = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
+                  "/usr/share/pciids/pci.ids", "/var/lib/pciutils/pci.ids")
+_pci_names = None
+
+
+def _read_text(path):
+    """Stripped file contents, or None if unreadable/empty (a sensor that is absent)."""
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def _read_int(path):
+    v = _read_text(path)
+    if v is None:
+        return None
+    try:
+        return int(v, 0)
+    except ValueError:
+        return None
+
+
+def _load_pci_names():
+    """Parse pci.ids into {(vendor, device): name}, plus a subtree fallback.
+
+    pci.ids is the same table lspci uses. Kernel sysfs gives only numeric ids, and a
+    card's marketing name is the one thing that makes the display readable, so read it
+    from the file rather than printing "1002:7551". Absent/odd file -> {} and ids are
+    shown instead."""
+    global _pci_names
+    if _pci_names is not None:
+        return _pci_names
+    names = {}
+    for path in _PCI_IDS_FILES:
+        try:
+            with open(path, "r", errors="replace") as fh:
+                vend = dev = None
+                for line in fh:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    if not line[0].isspace():                  # vendor line: "1002  AMD/ATI"
+                        parts = line.split(None, 1)
+                        if len(parts) == 2 and re.fullmatch(r"[0-9a-fA-F]{4}", parts[0]):
+                            vend, dev = int(parts[0], 16), None
+                            names.setdefault(("v", vend), parts[1].strip())
+                        else:
+                            vend = dev = None
+                    elif vend is not None and line.startswith("\t") and not line.startswith("\t\t"):
+                        parts = line.strip().split(None, 1)    # device line: "7551  Navi 48 [...]"
+                        if len(parts) == 2 and re.fullmatch(r"[0-9a-fA-F]{4}", parts[0]):
+                            dev = int(parts[0], 16)
+                            names[(vend, dev)] = parts[1].strip()
+        except OSError:
+            continue
+        if names:
+            break
+    _pci_names = names
+    return names
+
+
+def _pci_name(vendor, device, subvendor=None, subdevice=None):
+    """Marketing name for a PCI id from pci.ids; '' if the table has no entry.
+
+    A subsystem entry ("1da2 e490  Sapphire Pulse ...") is preferred over the chip
+    name because it is what the card actually is, but most cards only have the chip
+    entry, which still beats a bare hex id."""
+    names = _load_pci_names()
+    if subvendor is not None and subdevice is not None:
+        # Subsystem table nests as vendor -> device -> "subvend subdev  name".
+        for path in _PCI_IDS_FILES:
+            try:
+                with open(path, "r", errors="replace") as fh:
+                    want_v = "\t%04x  " % vendor
+                    want_d = "\t%04x  " % device
+                    in_v = in_d = False
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        if not line[0].isspace():          # vendor line
+                            in_v = line.startswith(want_v)
+                            in_d = False
+                        elif in_v and line.startswith("\t") and not line.startswith("\t\t"):
+                            in_d = line.startswith(want_d)  # device line
+                        elif in_v and in_d and line.startswith("\t\t"):
+                            parts = line.strip().split(None, 2)
+                            if len(parts) == 3:
+                                try:
+                                    if (int(parts[0], 16), int(parts[1], 16)) == (subvendor, subdevice):
+                                        return parts[2].strip()
+                                except ValueError:
+                                    pass
+            except OSError:
+                continue
+            break
+    return names.get((vendor, device), "")
+
+
+def _pci_display_devices():
+    """[(devpath, bus, vendor, device, subvendor, subdevice, driver)] for display-class
+    PCI devices.
+
+    NVIDIA and AMD cards are both reached this way, so autodetection needs no notion of
+    "which vendor is present" up front: whichever ones enumerate are read, and a host
+    with both shows both. devpath is returned rather than reconstructed from bus, so the
+    readers find each card's hwmon/DRM nodes by path identity."""
+    out = []
+    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        cls = _read_int(os.path.join(dev, "class"))
+        if cls is None or (cls >> 16) != 0x03:        # 0x03xxxx = display controller
+            continue
+        sub = _read_int(os.path.join(dev, "subsystem_vendor"))
+        subdev = _read_int(os.path.join(dev, "subsystem_device"))
+        try:
+            # driver is a symlink to .../drivers/amdgpu; take the leaf of its real target.
+            driver = os.path.basename(os.path.realpath(os.path.join(dev, "driver")))
+        except OSError:
+            driver = ""
+        if driver == "driver":                         # unreadable/odd link: fall back to name
+            driver = _read_text(os.path.join(dev, "driver", "module", "name")) or ""
+        out.append((dev, os.path.basename(dev), _read_int(os.path.join(dev, "vendor")),
+                    _read_int(os.path.join(dev, "device")), sub, subdev, driver))
+    return out
+
+
+def _hwmon_for(devpath):
+    """hwmon directory belonging to the PCI device at `devpath`, or None.
+
+    A card's sensors hang off its own PCI device, so matching on the resolved sysfs
+    path ties a hwmon node to exactly one card. Name-based matching (any hwmon called
+    "amdgpu") would be wrong on a multi-AMD-card host: it would hand every card the
+    first card's temperatures."""
+    real = os.path.realpath(devpath)
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if os.path.realpath(os.path.join(hw, "device")) == real:
+                return hw
+        except OSError:
+            continue
+    return None
+
+
+def _drm_for(devpath):
+    """DRM card node belonging to the PCI device at `devpath`, or None."""
+    real = os.path.realpath(devpath)
+    for card in glob.glob("/sys/class/drm/card[0-9]*"):
+        if "-" in os.path.basename(card):             # connector node, not the card
+            continue
+        try:
+            if os.path.realpath(os.path.join(card, "device")) == real:
+                return card
+        except OSError:
+            continue
+    return None
+
+
+# ---- GPU (AMD, sysfs) -----------------------------------------------------
+def _fdinfo_engine_ns(card):
+    """Busy nanoseconds on the card's graphics engine across all DRM clients, or None.
+
+    amdgpu's gpu_busy_percent is absent on some kernels and on APUs, and reads 0 when no
+    client in this namespace holds the device open. The per-client DRM fdinfo counters
+    are what nvtop uses, and they cover the case gpu_busy_percent does not: work
+    submitted by a process (or container) elsewhere on the machine."""
+    want = _canon_bus(os.path.basename(os.path.realpath(os.path.join(card, "device"))))
+    total, seen = 0, False
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        d = "/proc/%s/fdinfo" % pid
+        try:
+            fds = os.listdir(d)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                with open(os.path.join(d, fd)) as fh:
+                    dev = engine = None
+                    for line in fh:
+                        if line.startswith("drm-pdev:"):
+                            dev = line.split(":", 1)[1].strip()
+                        elif line.startswith("drm-engine-gfx:"):
+                            engine = line.split(":", 1)[1].strip().split()[0]
+                        elif line.startswith("drm-engine-compute:") and engine is None:
+                            engine = line.split(":", 1)[1].strip().split()[0]
+            except (OSError, ValueError, IndexError):
+                continue
+            if dev and engine and _canon_bus(dev) == want:
+                try:
+                    total += int(engine)
+                    seen = True
+                except ValueError:
+                    pass
+    return total if seen else None
+
+
+class _FdinfoBusy:
+    """Turns the cumulative fdinfo engine counter into a busy percentage over time.
+
+    One instance per card. The first sample has no interval to divide by, so it reports
+    nothing rather than a bogus number; from the second frame on the delta over the real
+    elapsed time gives a genuine utilisation figure."""
+    def __init__(self):
+        self.prev = None
+
+    def update(self, card):
+        now = _fdinfo_engine_ns(card)
+        t = time.monotonic()
+        if now is None:
+            return None
+        prev_pair, self.prev = self.prev, (now, t)
+        if prev_pair is None:
+            return None                                # first sample: no interval yet
+        prev, pt = prev_pair
+        if t <= pt or now < prev:                      # counter reset, or clock skew
+            return None
+        return max(0.0, min(100.0, 100.0 * (now - prev) / ((t - pt) * 1e9)))
+
+
+def _hwmon_temp(hw, wanted):
+    """Temperature in C for the temp channel whose label matches `wanted`.
+
+    amdgpu labels its channels "edge", "junction", "mem"; matching the label rather
+    than the index keeps working if a kernel orders or omits channels differently."""
+    for tf in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+        if (_read_text(tf.replace("_input", "_label")) or "").lower() == wanted:
+            v = _read_int(tf)
+            if v is not None and v > 0:
+                return v / 1000.0
+    return None
+
+
+def read_amd_sysfs(busy=None):
+    """Per-GPU dicts for AMD cards via sysfs. [] if there are none.
+
+    Deliberately no rocm-smi/amd-smi: sysfs is present on every kernel with the amdgpu
+    driver, needs no ROCm install, and covers integrated APUs that rocm-smi often
+    misreports. Every field degrades to None on its own, so a card exposing only some
+    sensors still shows what it has.
+
+    `busy` is an optional {bus: _FdinfoBusy} cache so the fdinfo counters -- the only
+    utilisation source on kernels without gpu_busy_percent -- are differenced over time
+    rather than reported raw."""
+    busy = busy if busy is not None else {}
+    gpus = []
+    for devpath, bus, vendor, device, subv, subd, driver in _pci_display_devices():
+        if vendor != VENDOR_AMD or driver not in ("amdgpu", "radeon"):
+            continue
+        hw = _hwmon_for(devpath)
+        name = _pci_name(vendor, device, subv, subd) or "AMD GPU"
+        g = {
+            "index": len(gpus), "vendor": "amd", "name": name, "bus": bus,
+            "util": None, "mem_used": None, "mem_total": None,
+            "temp": _hwmon_temp(hw, "edge") if hw else None,
+            "mem_temp": _hwmon_temp(hw, "mem") if hw else None,
+            "hotspot": _hwmon_temp(hw, "junction") if hw else None,
+            "power": None, "power_max": None, "fan": None, "clock": None,
+            "fan_unit": "rpm",
+        }
+        if hw:
+            pw = _read_int(os.path.join(hw, "power1_input"))
+            cap = _read_int(os.path.join(hw, "power1_cap"))
+            if pw is not None and pw >= 0:
+                g["power"] = pw / 1e6
+            if cap:
+                g["power_max"] = cap / 1e6
+            g["fan"] = _read_int(os.path.join(hw, "fan1_input"))
+            sclk = _read_int(os.path.join(hw, "freq1_input"))
+            if sclk:
+                g["clock"] = sclk / 1e6
+        card = _drm_for(devpath)
+        if card:
+            busy_pct = _read_int(os.path.join(card, "device", "gpu_busy_percent"))
+            if busy_pct is None:
+                # Absent on some kernels; difference the fdinfo counters instead.
+                busy_pct = busy.setdefault(bus, _FdinfoBusy()).update(card)
+            g["util"] = busy_pct
+            used = _read_int(os.path.join(card, "device", "mem_info_vram_used"))
+            tot = _read_int(os.path.join(card, "device", "mem_info_vram_total"))
+            if used is not None and tot:
+                g["mem_used"], g["mem_total"] = used / 1048576.0, tot / 1048576.0
+            if g["clock"] is None:
+                m = re.search(r"^\s*\d+:\s*(\d+)\s*Mhz\s*\*", _read_text(
+                    os.path.join(card, "device", "pp_dpm_sclk")) or "", re.M)
+                if m:
+                    g["clock"] = float(m.group(1))
+        gpus.append(g)
+    return gpus
 
 
 # ---- GPU (nvidia-smi) -----------------------------------------------------
@@ -69,6 +375,7 @@ def read_gpu_info():
             idx = d.get("index", "")
             gpus.append({
                 "index": int(idx) if idx.isdigit() else len(gpus),
+                "vendor": "nvidia",
                 "name": d.get("name") or "GPU",
                 "bus": d.get("pci.bus_id") or "",
                 "util": num(d.get("utilization.gpu")),
@@ -76,10 +383,96 @@ def read_gpu_info():
                 "temp": num(d.get("temperature.gpu")), "mem_temp": num(d.get("temperature.memory")),
                 "power": num(d.get("power.draw")), "power_max": num(d.get("power.limit")),
                 "fan": num(d.get("fan.speed")), "clock": num(d.get("clocks.sm")),
+                "fan_unit": "%",
             })
         if gpus:
             return gpus
     return []
+
+
+def read_nvidia_sysfs():
+    """Per-GPU dicts for NVIDIA cards from sysfs alone, [] if there are none.
+
+    A fallback for when nvidia-smi cannot talk to the driver -- version skew between
+    the userspace tools and the loaded module, a container without the device nodes, or
+    the driver wedged -- which is otherwise indistinguishable from "no GPU here". The
+    kernel still reports name, temperature, power, clock and VRAM in that state, so a
+    card stays on screen instead of vanishing behind a "no GPUs" line.
+
+    What sysfs cannot give without the driver's own libraries is SM utilization and fan
+    duty, so those stay n/a (NVIDIA's hwmon node is built by the driver and disappears
+    with it). When nvidia-smi works it is preferred, since it has both."""
+    gpus = []
+    for devpath, bus, vendor, device, subv, subd, driver in _pci_display_devices():
+        if vendor != VENDOR_NVIDIA:
+            continue
+        hw = _hwmon_for(devpath)
+        g = {
+            "index": len(gpus), "vendor": "nvidia",
+            "name": _pci_name(vendor, device, subv, subd) or "NVIDIA GPU", "bus": bus,
+            "util": None, "mem_used": None, "mem_total": None,
+            "temp": None, "mem_temp": None, "hotspot": None,
+            "power": None, "power_max": None, "fan": None, "clock": None,
+            "fan_unit": "%",
+        }
+        if hw:
+            for tf in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+                if (_read_text(tf.replace("_input", "_label")) or "").lower() == "junction":
+                    v = _read_int(tf)                      # nvidia exposes junction only
+                    if v:
+                        g["hotspot"] = v / 1000.0
+            v = _read_int(os.path.join(hw, "temp1_input"))
+            if v:
+                g["temp"] = v / 1000.0
+            v = _read_int(os.path.join(hw, "power1_input"))
+            if v:
+                g["power"] = v / 1e6
+        # /proc/driver/nvidia survives a wedged or version-skewed nvidia-smi and carries
+        # the card's real name; prefer it over the generic pci.ids chip name.
+        for line in (_read_text("/proc/driver/nvidia/gpus/%s/information" % bus) or "").splitlines():
+            if line.lower().startswith("model:"):
+                g["name"] = line.split(":", 1)[1].strip() or g["name"]
+                break
+        card = _drm_for(devpath)
+        if card:
+            used = _read_int(os.path.join(card, "device", "mem_info_vram_used"))
+            tot = _read_int(os.path.join(card, "device", "mem_info_vram_total"))
+            # /sys/.../nvidia-smi/... is provided by the driver's own sysfs group when the
+            # module is loaded; VRAM figures live on the DRM node for the open module.
+            if used is not None and tot:
+                g["mem_used"], g["mem_total"] = used / 1048576.0, tot / 1048576.0
+        gpus.append(g)
+    return gpus
+
+
+def read_gpus(prefer_smi=True, vendor="auto", busy=None):
+    """All GPUs on the machine, NVIDIA and AMD, in one list with unique indices.
+
+    Autodetection is by enumeration, not by configuration: whichever vendors have
+    display-class PCI devices are read, so an NVIDIA-only, AMD-only or mixed host all
+    work, and a mixed host shows both side by side. NVIDIA keeps its nvidia-smi indices
+    so an existing learned rowmap stays valid; AMD is numbered after it.
+
+    Pass the same `busy` dict on every call so AMD fdinfo utilisation is differenced
+    across frames rather than recomputed from scratch."""
+    gpus = []
+    if prefer_smi and vendor in ("auto", "nvidia"):
+        gpus = read_gpu_info()                        # nvidia-smi, with its own indices
+        if gpus:
+            for g in gpus:
+                g.setdefault("vendor", "nvidia")
+                g.setdefault("fan_unit", "%")
+    if not gpus and vendor in ("auto", "nvidia"):
+        gpus = read_nvidia_sysfs()                    # smi absent or unable to reach the driver
+    # AMD is numbered after whatever NVIDIA contributed, and every index is reassigned
+    # from the final order so the two readers cannot both claim 0 on a mixed host.
+    for i, g in enumerate(gpus):
+        g["index"] = i
+    if vendor in ("auto", "amd"):
+        gpus += read_amd_sysfs(busy)
+    for i, g in enumerate(gpus):                      # read_amd_sysfs numbered from 0
+        g["index"] = i
+    return gpus
 
 
 # ---- GPU memory / hot-spot temps (nvidia-gpu-sensors, needs root) --------
@@ -279,6 +672,16 @@ def _pins(rows, gpus, tol):
     return pins
 
 
+def _nvidia_only(gpus):
+    """The NVIDIA subset of `gpus`.
+
+    nvidia-gpu-sensors enumerates NVIDIA cards only, so on a mixed host the AMD cards
+    must be filtered out before comparing row counts: otherwise two AMD GPUs alongside
+    two NVIDIA ones look like a four-row table and every row is misaligned. Entries
+    without a vendor predate the distinction and are treated as NVIDIA."""
+    return [g for g in gpus if g.get("vendor", "nvidia") == "nvidia"]
+
+
 def _align(rows, gpus, tol=3.0):
     """Map nvidia-gpu-sensors rows onto nvidia-smi GPUs, learning the map over time.
 
@@ -293,6 +696,7 @@ def _align(rows, gpus, tol=3.0):
     elimination. Normal use -- one GPU busy at a time -- fills the map in; it is then
     reused while the machine is idle and everything looks alike. A pin that disagrees
     with the cache means the cards moved, so the map is relearned from scratch."""
+    gpus = _nvidia_only(gpus)
     if not rows or not gpus or len(rows) != len(gpus) or len(gpus) > 8:
         return {}
 
@@ -332,10 +736,16 @@ def _align(rows, gpus, tol=3.0):
 
 
 def _unknown(gpus):
-    """GPU indices whose sensor row is not yet identified.
+    """NVIDIA GPU indices whose nvidia-gpu-sensors row is not yet identified.
+
+    AMD cards read their memory and junction temperatures straight from hwmon, with no
+    row to line up, so they are never "unknown" and are filtered out here -- otherwise
+    autolearn would try to load them with CUDA torch and wait out a budget for a map
+    that is already complete.
 
     The driver states the order outright where /proc is available, in which case
     nothing is ever unknown and no learning happens at all."""
+    gpus = _nvidia_only(gpus)
     known = set((_driver_map(gpus) or {}).values())
     known |= set((_load_map(gpus) or {}).values())
     return [g["index"] for g in gpus if g["index"] not in known]
@@ -379,11 +789,11 @@ def autolearn(binary, budget=75.0, size=16384, quiet=False):
     cards not yet recognised."""
     if not binary:
         return
-    gpus = read_gpu_info()
+    gpus = read_gpus()
     if not gpus:
         return
     read_gpu_extra(binary, gpus)                 # a free pin if the machine is uneven
-    missing = _unknown(read_gpu_info())
+    missing = _unknown(read_gpus())
     if not missing:
         return
     say = (lambda m: None) if quiet else (lambda m: print(m, file=sys.stderr, flush=True))
@@ -396,11 +806,17 @@ def autolearn(binary, budget=75.0, size=16384, quiet=False):
     py, stress = gen
     say(f"{PROG}: identifying sensor rows for GPU(s) {', '.join(map(str, missing))} "
         f"\u2014 one-time, up to {budget:.0f}s each, stopping as soon as each is known")
+    nv = _nvidia_only(gpus)
     for index in missing:
+        # stress.py addresses cards by CUDA device, which counts NVIDIA cards only, while
+        # `index` is our display index over both vendors. On a mixed host those differ, so
+        # translate; on an NVIDIA-only host the mapping is the identity.
+        cuda = [i for i, g in enumerate(nv) if g["index"] == index]
+        cuda = cuda[0] if cuda else index
         env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID")
         try:
             proc = subprocess.Popen(
-                [py, stress, "--gpu", str(index), "--size", str(size),
+                [py, stress, "--gpu", str(cuda), "--size", str(size),
                  "--timeout", str(int(budget) + 5), "--interval", "1e9"],
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         except (OSError, subprocess.SubprocessError) as err:
@@ -414,7 +830,7 @@ def autolearn(binary, budget=75.0, size=16384, quiet=False):
                     say(f"{PROG}: stress.py exited: {why[-1] if why else 'no output'}")
                     return
                 time.sleep(2.0)
-                live = read_gpu_info()
+                live = read_gpus()
                 read_gpu_extra(binary, live)     # pins and persists as a side effect
                 if live and index not in _unknown(live):
                     say(f"{PROG}: GPU {index} identified")
@@ -708,14 +1124,16 @@ def build_frame(gpus, cpu, cooling, interval, width):
     L.append("")
 
     if not gpus:
-        L.append(c("  nvidia-smi returned no GPUs (is it installed / are GPUs visible?)", "red"))
+        L.append(c("  no GPUs found (nvidia-smi / /sys/class/drm both empty — "
+                   "driver loaded, /sys mounted?)", "red"))
     for g in gpus:
         prefix = "  GPU %d  " % g["index"]          # visible prefix width (no ANSI)
         avail = max(12, width - len(prefix) - 1)
         name = g["name"]
         if len(name) > avail: name = name[:avail - 1] + "…"
         label = c(bold("GPU " + str(g["index"])), "blue")
-        L.append("  " + label + "  " + name)
+        vtag = c(" [%s]" % g["vendor"], "grey") if g.get("vendor") else ""
+        L.append("  " + label + "  " + name + vtag)
 
         clk = ("%.0fMHz" % g["clock"]) if g["clock"] is not None else "n/a"
         util = g["util"]
@@ -731,8 +1149,16 @@ def build_frame(gpus, cpu, cooling, interval, width):
                  f"{pctstr}   {c(memtxt, 'grey')}")
 
         pw = (f"{g['power']:.0f}/{g['power_max']:.0f}W"
-              if g["power"] is not None and g["power_max"] is not None else "n/a")
-        fan = f"{g['fan']:.0f}%" if g["fan"] is not None else "n/a"
+              if g["power"] is not None and g["power_max"] is not None
+              else (f"{g['power']:.0f}W" if g["power"] is not None else "n/a"))
+        # AMD hwmon reports fan RPM where NVIDIA reports duty %, so the unit travels with
+        # the value rather than being assumed.
+        if g["fan"] is None:
+            fan = "n/a"
+        elif g.get("fan_unit") == "rpm":
+            fan = "%.0frpm" % g["fan"]
+        else:
+            fan = "%.0f%%" % g["fan"]
         hs = g.get("hotspot")
         learning = g.get("sensor_learning")
         hs_cell = c(fmt_temp(hs), temp_color(hs)) if hs is not None \
@@ -742,7 +1168,7 @@ def build_frame(gpus, cpu, cooling, interval, width):
             else c(fmt_temp(g["mem_temp"]), temp_color(g["mem_temp"]))
         L.append(f"    temp {c(fmt_temp(g['temp']), temp_color(g['temp']))}"
                  f"   mem-temp {mem_cell}"
-                 f"{hs_part}   fan {fan:>4}   power {pw}")
+                 f"{hs_part}   fan {fan:>6}   power {pw}")
         L.append("")
 
     pending = [g["index"] for g in gpus if g.get("sensor_learning")]
@@ -822,6 +1248,7 @@ def main():
     turbo = TurbostatMeter(args.interval)
     gpu_sensors = find_gpu_sensors(args.gpu_sensors)
     gs_fails = 0   # disable the helper after repeated empties (unsupported / not root)
+    busy_cache = {}  # per-bus fdinfo differencers, kept across frames (AMD utilisation)
     if not args.no_autolearn:
         # One-time: work out which sensor row is which GPU, then remember it. No-op
         # once the map is complete, so only the first run on a machine pays for it.
@@ -840,7 +1267,7 @@ def main():
     try:
         while True:
             width = shutil.get_terminal_size((100, 40)).columns
-            gpus = read_gpu_info()
+            gpus = read_gpus(vendor=args.vendor, busy=busy_cache)
             extra = read_gpu_extra(gpu_sensors, gpus)  # mem/hot-spot temps nvidia-smi lacks
             if gpu_sensors and gpus:
                 if extra is None:                 # binary unusable, not merely unaligned
