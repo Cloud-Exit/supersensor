@@ -51,6 +51,7 @@ def parse_args():
 _PCI_IDS_FILES = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
                   "/usr/share/pciids/pci.ids", "/var/lib/pciutils/pci.ids")
 _pci_names = None
+_pci_name_cache = {}
 
 
 def _read_text(path):
@@ -115,7 +116,18 @@ def _pci_name(vendor, device, subvendor=None, subdevice=None):
 
     A subsystem entry ("1da2 e490  Sapphire Pulse ...") is preferred over the chip
     name because it is what the card actually is, but most cards only have the chip
-    entry, which still beats a bare hex id."""
+    entry, which still beats a bare hex id.
+
+    Memoised on the full id tuple: the subsystem pass scans the 1.6MB table line by
+    line, and this is called once per card per frame."""
+    key = (vendor, device, subvendor, subdevice)
+    if key in _pci_name_cache:
+        return _pci_name_cache[key]
+    _pci_name_cache[key] = name = _pci_name_uncached(*key)
+    return name
+
+
+def _pci_name_uncached(vendor, device, subvendor=None, subdevice=None):
     names = _load_pci_names()
     if subvendor is not None and subdevice is not None:
         # Subsystem table nests as vendor -> device -> "subvend subdev  name".
@@ -206,19 +218,23 @@ def _drm_for(devpath):
 
 
 # ---- GPU (AMD, sysfs) -----------------------------------------------------
-def _fdinfo_engine_ns(card):
-    """Busy nanoseconds on the card's graphics engine across all DRM clients, or None.
+def _fdinfo_engine_ns(cards):
+    """{canonical bus: busy nanoseconds} across all DRM clients, for every card at once.
 
     amdgpu's gpu_busy_percent is absent on some kernels and on APUs, and reads 0 when no
     client in this namespace holds the device open. The per-client DRM fdinfo counters
     are what nvtop uses, and they cover the case gpu_busy_percent does not: work
-    submitted by a process (or container) elsewhere on the machine."""
-    want = _canon_bus(os.path.basename(os.path.realpath(os.path.join(card, "device"))))
-    total, seen = 0, False
+    submitted by a process (or container) elsewhere on the machine.
+
+    Every fdinfo file names its own card via drm-pdev, so one walk serves all cards --
+    with N cards a per-card scan would re-read every process's descriptors N times."""
+    want = {_canon_bus(os.path.basename(os.path.realpath(os.path.join(c, "device"))))
+            for c in cards}
+    totals = {}
     try:
         pids = [p for p in os.listdir("/proc") if p.isdigit()]
     except OSError:
-        return None
+        return totals
     for pid in pids:
         d = "/proc/%s/fdinfo" % pid
         try:
@@ -238,13 +254,13 @@ def _fdinfo_engine_ns(card):
                             engine = line.split(":", 1)[1].strip().split()[0]
             except (OSError, ValueError, IndexError):
                 continue
-            if dev and engine and _canon_bus(dev) == want:
+            bus = _canon_bus(dev) if dev else None
+            if bus in want and engine:
                 try:
-                    total += int(engine)
-                    seen = True
+                    totals[bus] = totals.get(bus, 0) + int(engine)
                 except ValueError:
                     pass
-    return total if seen else None
+    return totals
 
 
 class _FdinfoBusy:
@@ -256,27 +272,32 @@ class _FdinfoBusy:
     def __init__(self):
         self.prev = None
 
-    def update(self, card):
-        now = _fdinfo_engine_ns(card)
+    def update(self, ns):
+        """`ns` is this frame's cumulative counter for the card, or None if unreadable."""
         t = time.monotonic()
-        if now is None:
+        if ns is None:
             return None
-        prev_pair, self.prev = self.prev, (now, t)
+        prev_pair, self.prev = self.prev, (ns, t)
         if prev_pair is None:
             return None                                # first sample: no interval yet
         prev, pt = prev_pair
-        if t <= pt or now < prev:                      # counter reset, or clock skew
+        if t <= pt or ns < prev:                       # counter reset, or clock skew
             return None
-        return max(0.0, min(100.0, 100.0 * (now - prev) / ((t - pt) * 1e9)))
+        return max(0.0, min(100.0, 100.0 * (ns - prev) / ((t - pt) * 1e9)))
 
 
 def _hwmon_temp(hw, wanted):
     """Temperature in C for the temp channel whose label matches `wanted`.
 
     amdgpu labels its channels "edge", "junction", "mem"; matching the label rather
-    than the index keeps working if a kernel orders or omits channels differently."""
+    than the index keeps working if a kernel orders or omits channels differently.
+
+    `wanted` may be a tuple, and an empty string matches an unlabelled channel: the
+    older radeon driver exposes a bare unlabelled temp1_input, and a label-only match
+    would leave such a card rendering its name and nothing else."""
+    wanted = (wanted,) if isinstance(wanted, str) else wanted
     for tf in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
-        if (_read_text(tf.replace("_input", "_label")) or "").lower() == wanted:
+        if (_read_text(tf.replace("_input", "_label")) or "").lower() in wanted:
             v = _read_int(tf)
             if v is not None and v > 0:
                 return v / 1000.0
@@ -296,6 +317,18 @@ def read_amd_sysfs(busy=None):
     rather than reported raw."""
     busy = busy if busy is not None else {}
     gpus = []
+    cards = []          # (devpath, bus, drm card) for cards lacking gpu_busy_percent
+    for devpath, bus, vendor, device, subv, subd, driver in _pci_display_devices():
+        if vendor != VENDOR_AMD or driver not in ("amdgpu", "radeon"):
+            continue
+        card = _drm_for(devpath)
+        if card is not None and _read_int(
+                os.path.join(card, "device", "gpu_busy_percent")) is None:
+            cards.append((devpath, bus, card))
+    # One /proc walk for every card that needs it, not one walk per card.
+    fdinfo = _fdinfo_engine_ns([c for _, _, c in cards]) if cards else {}
+    fallback = {bus: fdinfo.get(_canon_bus(bus)) for _, bus, _ in cards}
+
     for devpath, bus, vendor, device, subv, subd, driver in _pci_display_devices():
         if vendor != VENDOR_AMD or driver not in ("amdgpu", "radeon"):
             continue
@@ -304,7 +337,9 @@ def read_amd_sysfs(busy=None):
         g = {
             "index": len(gpus), "vendor": "amd", "name": name, "bus": bus,
             "util": None, "mem_used": None, "mem_total": None,
-            "temp": _hwmon_temp(hw, "edge") if hw else None,
+            # The empty alternative picks up the older radeon driver's unlabelled
+            # temp1_input, which would otherwise leave the card entirely blank.
+            "temp": _hwmon_temp(hw, ("edge", "")) if hw else None,
             "mem_temp": _hwmon_temp(hw, "mem") if hw else None,
             "hotspot": _hwmon_temp(hw, "junction") if hw else None,
             "power": None, "power_max": None, "fan": None, "clock": None,
@@ -326,7 +361,7 @@ def read_amd_sysfs(busy=None):
             busy_pct = _read_int(os.path.join(card, "device", "gpu_busy_percent"))
             if busy_pct is None:
                 # Absent on some kernels; difference the fdinfo counters instead.
-                busy_pct = busy.setdefault(bus, _FdinfoBusy()).update(card)
+                busy_pct = busy.setdefault(bus, _FdinfoBusy()).update(fallback.get(bus))
             g["util"] = busy_pct
             used = _read_int(os.path.join(card, "device", "mem_info_vram_used"))
             tot = _read_int(os.path.join(card, "device", "mem_info_vram_total"))
@@ -405,7 +440,11 @@ def read_nvidia_sysfs():
     nvidia-smi works it is preferred, since it has all of them."""
     gpus = []
     for devpath, bus, vendor, device, subv, subd, driver in _pci_display_devices():
-        if vendor != VENDOR_NVIDIA or driver != "nvidia":
+        # nouveau as well as nvidia: an open-source-driver host has no nvidia-smi at all,
+        # so this fallback is its only source, and nouveau's hwmon node (an unlabelled
+        # temp1_input) is handled by the label dispatch below. Anything else holding the
+        # card -- vfio-pci for passthrough, or no driver bound -- is left out.
+        if vendor != VENDOR_NVIDIA or driver not in ("nvidia", "nouveau"):
             continue
         hw = _hwmon_for(devpath)
         g = {
@@ -1168,7 +1207,7 @@ def build_frame(gpus, cpu, cooling, interval, width):
             else c(fmt_temp(g["mem_temp"]), temp_color(g["mem_temp"]))
         L.append(f"    temp {c(fmt_temp(g['temp']), temp_color(g['temp']))}"
                  f"   mem-temp {mem_cell}"
-                 f"{hs_part}   fan {fan:>6}   power {pw}")
+                 f"{hs_part}   fan {fan:>7}   power {pw}")
         L.append("")
 
     pending = [g["index"] for g in gpus if g.get("sensor_learning")]

@@ -33,7 +33,8 @@ and power, the CPU shows aggregate + per-core usage, and the loop shows coolant 
 | Source | Provides | Needs | If unavailable |
 |---|---|---|---|
 | `nvidia-smi` | NVIDIA GPU util, VRAM, core temp, power, fan, clock | NVIDIA driver | falls back to sysfs: name/temp/power only |
-| sysfs `/sys/class/drm`, hwmon | **AMD** GPU util, VRAM, temps, power, fan, clock | `amdgpu` driver | AMD cards absent |
+| sysfs `/sys/class/drm`, hwmon | **AMD** (`amdgpu`, `radeon`) GPU util, VRAM, temps, power, fan, clock | either driver | AMD cards absent |
+| sysfs + `/proc/driver/nvidia` | NVIDIA fallback when `nvidia-smi` fails, and `nouveau` cards | `nvidia`/`nouveau` driver | NVIDIA cards absent |
 | [`nvidia-gpu-sensors`](https://github.com/philipl/nvidia-gpu-sensors) | NVIDIA GPU **memory** & **hot-spot** temp | binary + root | those columns show `n/a` (nvidia-smi's mem temp still used if it has one) |
 | `turbostat` | CPU **package**/core power, avg freq | `turbostat` + root + MSR | falls back to RAPL |
 | RAPL (`/sys/class/powercap`) | CPU package power | powercap + root | power shows `n/a` |
@@ -76,17 +77,18 @@ coolant — works unprivileged. AMD sensors come from sysfs and need no privileg
 ## AMD GPUs
 
 AMD cards are read straight from **sysfs** — no `rocm-smi`/`amd-smi`, no ROCm install. Cards are
-found by walking `/sys/bus/pci` for display-class devices with the `amdgpu` driver, which works on
-integrated APUs and headless compute hosts as well as discrete cards (RX 9000 series, **RX 9700 AI
-PRO / Radeon AI PRO R9700**, Radeon Pro, Instinct, …). A host with both vendors shows both, side by
-side, with each card tagged by vendor.
+found by walking `/sys/bus/pci` for display-class devices with the `amdgpu` or older `radeon` driver,
+which works on integrated APUs and headless compute hosts as well as discrete cards (RX 9000 series,
+**RX 9700 AI PRO / Radeon AI PRO R9700**, Radeon Pro, Instinct, …). A host with both vendors shows
+both, side by side, with each card tagged by vendor.
 
 Temperatures come from the driver's hwmon channels, matched by **label** rather than index so a
 kernel that orders them differently still lines up: `edge` → core temp, `junction` → hot spot,
-`mem` → memory temp. Power is `power1_input` against `power1_cap`, VRAM is `mem_info_vram_*`,
-utilization is `gpu_busy_percent` (falling back to DRM `fdinfo` engine counters on kernels that do
-not expose it), and the clock is the current `pp_dpm_sclk` state. **Fan is shown in RPM** for AMD
-where NVIDIA reports duty %.
+`mem` → memory temp. `radeon` exposes only an unlabelled `temp1_input`, which is read as the core
+temp. Power is `power1_input` against `power1_cap`, VRAM is `mem_info_vram_*`, utilization is
+`gpu_busy_percent` (falling back to DRM `fdinfo` engine counters on kernels that do not expose it),
+and the clock is the current `pp_dpm_sclk` state. **Fan is shown in RPM** for AMD where NVIDIA
+reports duty %.
 
 Sensors are tied to a card by resolving the hwmon/DRM node's real sysfs path against that card's
 PCI device, so a multi-AMD-card host attributes every reading correctly rather than handing every
@@ -109,8 +111,12 @@ and power. **VRAM, SM utilization, clock and fan duty stay `n/a`** in that state
 exposes none of them for this driver — nvidia-smi obtains those over `libnvidia-ml` ioctls, so unlike
 amdgpu there is no `mem_info_vram_*` to fall back to.
 
-Only cards actually bound to the `nvidia` driver are read this way, so a card handed to `vfio-pci`
-for passthrough does not appear as a phantom all-`n/a` GPU.
+The open-source **`nouveau`** driver is covered by the same path. Such a host has no `nvidia-smi` at
+all, so this is its only source; nouveau's hwmon node is an unlabelled `temp1_input`, which is read
+as the core temperature.
+
+Only cards actually bound to `nvidia` or `nouveau` are read, so a card handed to `vfio-pci` for
+passthrough does not appear as a phantom all-`n/a` GPU.
 
 ## NVIDIA GPU memory & hot-spot temps (nvidia-gpu-sensors)
 

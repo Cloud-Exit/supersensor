@@ -10,13 +10,35 @@ def parse_args():
     p.add_argument("--size", type=int, default=16384, help="matmul dimension (default: 16384)")
     return p.parse_args()
 
+def _display_devices():
+    """PCI device paths for display-class devices (vendor id read separately)."""
+    out = []
+    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        try:
+            if open(os.path.join(dev, "class")).read().strip()[:4] != "0x03":
+                continue
+        except OSError:
+            continue
+        out.append(dev)
+    return out
+
+
+def _vendor(dev):
+    try: return open(os.path.join(dev, "vendor")).read().strip().lower()
+    except OSError: return ""
+
+
 def read_gpu_temps():
     """Return {gpu_index: (gpu_temp_C, mem_temp_C)} for whatever GPUs are present.
 
-    NVIDIA comes from nvidia-smi (always present in NGC images). AMD has no such tool
-    guaranteed, so it is read from the amdgpu hwmon nodes, which report edge/junction/mem
-    labelled channels. Cards from both vendors are returned in one dict, AMD numbered
-    after NVIDIA, matching supersensor's own ordering."""
+    NVIDIA comes from nvidia-smi. AMD has no such tool guaranteed, so it is read from
+    the amdgpu hwmon nodes, which report edge/junction/mem labelled channels.
+
+    Indices match supersensor's when both are run on the same host, which is the point
+    of sampling here at all: NVIDIA-vendor cards are numbered first and AMD after, and
+    the NVIDIA side includes cards found by sysfs when nvidia-smi is dead -- otherwise
+    AMD would start at 0 on a host where supersensor has already listed the NVIDIA cards
+    and every label in the stress log would name the wrong GPU."""
     res = {}
     try:
         out = subprocess.run(
@@ -36,13 +58,12 @@ def read_gpu_temps():
         idx, g, m = parts
         res[int(idx)] = (f(g), f(m))
         n = max(n, int(idx) + 1)
-    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
-        try:
-            if open(os.path.join(dev, "vendor")).read().strip() != "0x1002":
-                continue
-            if open(os.path.join(dev, "class")).read().strip()[:4] != "0x03":
-                continue
-        except OSError:
+    if n == 0:
+        # nvidia-smi gone: supersensor still lists these cards from sysfs, so reserve
+        # their slots to keep the two numberings identical.
+        n = len([d for d in _display_devices() if _vendor(d) == "0x10de"])
+    for dev in _display_devices():
+        if _vendor(dev) != "0x1002":
             continue
         edge = mem = None
         for hw in glob.glob(os.path.join(dev, "hwmon", "hwmon*")):
