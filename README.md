@@ -32,7 +32,7 @@ and power, the CPU shows aggregate + per-core usage, and the loop shows coolant 
 
 | Source | Provides | Needs | If unavailable |
 |---|---|---|---|
-| `nvidia-smi` | NVIDIA GPU util, VRAM, core temp, power, fan, clock | NVIDIA driver | falls back to sysfs (below) |
+| `nvidia-smi` | NVIDIA GPU util, VRAM, core temp, power, fan, clock | NVIDIA driver | falls back to sysfs: name/temp/power only |
 | sysfs `/sys/class/drm`, hwmon | **AMD** GPU util, VRAM, temps, power, fan, clock | `amdgpu` driver | AMD cards absent |
 | [`nvidia-gpu-sensors`](https://github.com/philipl/nvidia-gpu-sensors) | NVIDIA GPU **memory** & **hot-spot** temp | binary + root | those columns show `n/a` (nvidia-smi's mem temp still used if it has one) |
 | `turbostat` | CPU **package**/core power, avg freq | `turbostat` + root + MSR | falls back to RAPL |
@@ -96,16 +96,21 @@ AMD needs none of the row-alignment machinery the NVIDIA memory/hot-spot path us
 so AMD never shows `learning`.
 
 `--vendor nvidia` or `--vendor amd` restricts collection to one vendor; the default `auto` detects
-both.
+both. The filter also scopes the one-time sensor-row learning, so `--vendor amd` on a mixed host
+does not spin up CUDA loads for cards the frame will not show.
 
 ## NVIDIA: when `nvidia-smi` cannot reach the driver
 
 A driver/userspace version mismatch, a container without the device nodes, or a wedged module makes
 `nvidia-smi` fail outright — indistinguishable from "no GPU here", which is why the GPU section
 used to vanish. `nvidia-smi` is still preferred when it works, but if it returns nothing the card is
-read from sysfs instead: name (from `/proc/driver/nvidia`, falling back to `pci.ids`), temperature,
-power and VRAM. SM utilization and fan duty stay `n/a` in that state, since NVIDIA exposes them only
-through the driver's own libraries.
+read from sysfs instead: name (from `/proc/driver/nvidia`, falling back to `pci.ids`), temperature
+and power. **VRAM, SM utilization, clock and fan duty stay `n/a`** in that state, because the kernel
+exposes none of them for this driver — nvidia-smi obtains those over `libnvidia-ml` ioctls, so unlike
+amdgpu there is no `mem_info_vram_*` to fall back to.
+
+Only cards actually bound to the `nvidia` driver are read this way, so a card handed to `vfio-pci`
+for passthrough does not appear as a phantom all-`n/a` GPU.
 
 ## NVIDIA GPU memory & hot-spot temps (nvidia-gpu-sensors)
 

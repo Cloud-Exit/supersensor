@@ -396,15 +396,16 @@ def read_nvidia_sysfs():
     A fallback for when nvidia-smi cannot talk to the driver -- version skew between
     the userspace tools and the loaded module, a container without the device nodes, or
     the driver wedged -- which is otherwise indistinguishable from "no GPU here". The
-    kernel still reports name, temperature, power, clock and VRAM in that state, so a
-    card stays on screen instead of vanishing behind a "no GPUs" line.
+    kernel still reports name, temperature and power in that state, so a card stays on
+    screen instead of vanishing behind a "no GPUs" line.
 
-    What sysfs cannot give without the driver's own libraries is SM utilization and fan
-    duty, so those stay n/a (NVIDIA's hwmon node is built by the driver and disappears
-    with it). When nvidia-smi works it is preferred, since it has both."""
+    What sysfs cannot give is everything nvidia-smi obtains over libnvidia-ml ioctls:
+    VRAM, SM utilization, clock and fan duty. NVIDIA's DRM node carries no
+    mem_info_vram_* attributes the way amdgpu's does, so those stay n/a here. When
+    nvidia-smi works it is preferred, since it has all of them."""
     gpus = []
     for devpath, bus, vendor, device, subv, subd, driver in _pci_display_devices():
-        if vendor != VENDOR_NVIDIA:
+        if vendor != VENDOR_NVIDIA or driver != "nvidia":
             continue
         hw = _hwmon_for(devpath)
         g = {
@@ -416,14 +417,18 @@ def read_nvidia_sysfs():
             "fan_unit": "%",
         }
         if hw:
+            # Read every channel by its label, the way the AMD reader does. Taking
+            # temp1_input as the core temperature unconditionally is wrong when temp1
+            # *is* the junction channel, which would report one sensor as two.
             for tf in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
-                if (_read_text(tf.replace("_input", "_label")) or "").lower() == "junction":
-                    v = _read_int(tf)                      # nvidia exposes junction only
-                    if v:
-                        g["hotspot"] = v / 1000.0
-            v = _read_int(os.path.join(hw, "temp1_input"))
-            if v:
-                g["temp"] = v / 1000.0
+                label = (_read_text(tf.replace("_input", "_label")) or "").lower()
+                v = _read_int(tf)
+                if not v:
+                    continue
+                if label in ("junction", "hotspot"):
+                    g["hotspot"] = v / 1000.0
+                elif label in ("edge", "gpu", "core") or (label == "" and g["temp"] is None):
+                    g["temp"] = v / 1000.0
             v = _read_int(os.path.join(hw, "power1_input"))
             if v:
                 g["power"] = v / 1e6
@@ -433,14 +438,6 @@ def read_nvidia_sysfs():
             if line.lower().startswith("model:"):
                 g["name"] = line.split(":", 1)[1].strip() or g["name"]
                 break
-        card = _drm_for(devpath)
-        if card:
-            used = _read_int(os.path.join(card, "device", "mem_info_vram_used"))
-            tot = _read_int(os.path.join(card, "device", "mem_info_vram_total"))
-            # /sys/.../nvidia-smi/... is provided by the driver's own sysfs group when the
-            # module is loaded; VRAM figures live on the DRM node for the open module.
-            if used is not None and tot:
-                g["mem_used"], g["mem_total"] = used / 1048576.0, tot / 1048576.0
         gpus.append(g)
     return gpus
 
@@ -774,7 +771,7 @@ def _load_gen():
     return None
 
 
-def autolearn(binary, budget=75.0, size=16384, quiet=False):
+def autolearn(binary, budget=75.0, size=16384, quiet=False, vendor="auto"):
     """Identify each GPU's sensor row, and remember it.
 
     Rows are matched to GPUs by core temperature, which distinguishes a card only while
@@ -786,14 +783,17 @@ def autolearn(binary, budget=75.0, size=16384, quiet=False):
     When a CUDA-capable torch is available this also loads each still-unknown GPU
     briefly to force the issue, which turns "eventually" into "now". Without one, the
     passive route is all there is: the memory and hot-spot columns stay blank for the
-    cards not yet recognised."""
+    cards not yet recognised.
+
+    `vendor` scopes the work to the cards the frame will actually show, so
+    `--vendor amd` does not spawn CUDA loads for NVIDIA cards it has hidden."""
     if not binary:
         return
-    gpus = read_gpus()
+    gpus = read_gpus(vendor=vendor)
     if not gpus:
         return
     read_gpu_extra(binary, gpus)                 # a free pin if the machine is uneven
-    missing = _unknown(read_gpus())
+    missing = _unknown(read_gpus(vendor=vendor))
     if not missing:
         return
     say = (lambda m: None) if quiet else (lambda m: print(m, file=sys.stderr, flush=True))
@@ -1254,7 +1254,7 @@ def main():
         # once the map is complete, so only the first run on a machine pays for it.
         # In the live view the frame carries the progress; only speak up when there
         # is no frame to repeat it (--once, or piped output).
-        autolearn(gpu_sensors, quiet=not once)
+        autolearn(gpu_sensors, quiet=not once, vendor=args.vendor)
     # prime CPU/power deltas so the first frame shows real values, not noise
     time.sleep(min(args.interval, 0.3))
     if once and turbo.snapshot() is None:
@@ -1313,4 +1313,5 @@ def main():
             sys.stdout.flush()
 
 
-main()
+if __name__ == "__main__":
+    main()

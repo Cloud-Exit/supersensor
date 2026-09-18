@@ -65,16 +65,24 @@ def build_tree(root):
         devices.append(dev)
         return dev
 
-    # Healthy NVIDIA card: hwmon with junction temp + power, and a DRM node with VRAM.
+    # Healthy NVIDIA card. The kernel exposes no mem_info_vram_* for the nvidia driver
+    # (nvidia-smi gets VRAM over libnvidia-ml ioctls), so the fixture must not write
+    # them either. Two labelled channels, with junction on temp1, so a reader that
+    # blindly treats temp1_input as the core temperature is caught reporting one sensor
+    # as both core and hot spot.
     nv = card("0000:41:00.0", 0x10DE, 0x2B85, 0x10DE, 0x16A1, "nvidia", hwmon="hwmon7",
-              cards=[("card5", {"mem_info_vram_used": 1073741824,
-                                "mem_info_vram_total": 34359738368})])
+              cards=[("card5", {})])
     nhw = os.path.join(nv, "hwmon", "hwmon7")
+    mk(os.path.join(nhw, "temp2_input"), 44000)
+    mk(os.path.join(nhw, "temp2_label"), "edge")
     mk(os.path.join(nhw, "temp1_input"), 52000)
     mk(os.path.join(nhw, "temp1_label"), "junction")
     mk(os.path.join(nhw, "power1_input"), 350000000)
-    # NVIDIA card with the driver wedged: no hwmon, no DRM VRAM.
+    # NVIDIA card with the driver wedged: no hwmon at all.
     card("0000:01:00.0", 0x10DE, 0x2B85, 0x10DE, 0x16A1, "nvidia")
+    # A card bound to vfio-pci for passthrough: display class, NVIDIA vendor ids, but
+    # neither nvidia nor amdgpu bound, so it must not show as an all-n/a phantom.
+    card("0000:02:00.0", 0x10DE, 0x2B85, 0x10DE, 0x16A1, "vfio-pci")
 
     # AMD Radeon AI PRO R9700 (1002:7551) with every sensor amdgpu can expose.
     r9 = card("0000:03:00.0", 0x1002, 0x7551, 0x1DA2, 0xE490, "amdgpu", hwmon="hwmon9",
@@ -143,13 +151,20 @@ def main():
 
         print("NVIDIA sysfs fallback:")
         nv = m.read_nvidia_sysfs()
-        check(len(nv) == 2, "both NVIDIA cards found with nvidia-smi dead")
+        check(len(nv) == 2, "both bound NVIDIA cards found with nvidia-smi dead (%d)"
+              % len(nv))
+        check(all(g["bus"] != "0000:02:00.0" for g in nv),
+              "the vfio-pci passthrough card is not a phantom GPU")
         healthy = [g for g in nv if g["bus"] == "0000:41:00.0"]
         if healthy:
             g = healthy[0]
             check(g["hotspot"] == 52.0, "junction -> hotspot (%s)" % g["hotspot"])
+            # junction sits on temp1, so this catches temp being read from temp1_input
+            # unconditionally and mirroring the hot spot.
+            check(g["temp"] == 44.0, "edge -> temp, not temp1 (%s)" % g["temp"])
             check(abs(g["power"] - 350.0) < 1e-6, "power -> W (%s)" % g["power"])
-            check(abs(g["mem_total"] - 32768) < 1, "vram from DRM node")
+            check(g["mem_total"] is None and g["mem_used"] is None,
+                  "nvidia has no mem_info_vram_* in sysfs, so VRAM stays n/a")
 
         print("combined read_gpus (smi unavailable):")
         m.read_gpu_info = lambda: []
